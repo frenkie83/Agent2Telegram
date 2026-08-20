@@ -4,7 +4,7 @@ Code queues it and only logs it once picked up, as ``type: "attachment"`` /
 ``attachment.type == "queued_command"``. ``AttachBridge`` used to look only for ``"user"``
 records, so such a turn's reply was silently dropped (``_turn_from_tg`` stayed False).
 
-Also covers the fix's OWN regression, found by review the same day: rewinding ``_tpos`` to the
+Also covers the fix's OWN regression: rewinding ``_tpos`` to the
 turn's own (terminal) ``user`` record after a queued Telegram message joined it re-forwarded,
 after a restart, everything the agent had written BEFORE that message too — including whatever
 the terminal-originated part of the turn contained. The rewind point must land right after the
@@ -311,7 +311,7 @@ class QueuedMessageMidTurnTests(unittest.TestCase):
                           "a non-queued_command attachment must never set Telegram origin")
 
     def test_new_terminal_turn_after_a_tg_turn_resets_the_flag(self):
-        """Review, 2026-08-20: the flag must be able to go back to False. A turn that STARTS
+        """The flag must be able to go back to False. A turn that STARTS
         fresh from the terminal — a plain, non-queued 'user' record with no [TG] — must clear
         Telegram origin even though the PREVIOUS turn was Telegram-originated; otherwise, once
         any turn in a session touched Telegram, every later terminal-only turn would leak too.
@@ -331,12 +331,12 @@ class QueuedMessageMidTurnTests(unittest.TestCase):
                           "the terminal turn's reply must not leak to Telegram")
 
     def test_queued_message_without_tg_prefix_into_terminal_turn_stays_local(self):
-        """Second review round, 2026-08-20: a queued message is not automatically Telegram
-        origin just because it's queued — it still needs the [TG] prefix. On this machine, 4 of
-        6 real ``queued_command`` records are terminal (no [TG]), so this is the COMMON case, not
-        a theoretical one: a terminal turn joined by a terminal-typed queued message must stay
-        local. (Mutation this catches: the queued branch of ``_handle_event`` setting
-        ``self._turn_from_tg = True`` unconditionally, without checking the prefix.)"""
+        """A queued message is not automatically Telegram origin just because it's queued — it
+        still needs the [TG] prefix. In real transcripts, most ``queued_command`` records are
+        terminal (no [TG]), so this is the COMMON case, not a theoretical one: a terminal turn
+        joined by a terminal-typed queued message must stay local. (Mutation this catches: the
+        queued branch of ``_handle_event`` setting ``self._turn_from_tg = True`` unconditionally,
+        without checking the prefix.)"""
         self._feed(_user_record("pokracuj v uklidu"))                  # terminal-started turn
         self.assertFalse(self.bridge._turn_from_tg)
 
@@ -373,7 +373,7 @@ class ResumePositionQueuedMessageTests(unittest.TestCase):
         return b
 
     def test_queued_tg_message_into_terminal_turn_moves_rewind_point_past_it(self):
-        """The fix's OWN regression (caught by review): a queued TG message that RAISES the flag
+        """The fix's OWN regression: a queued TG message that RAISES the flag
         must move the rewind point to just after ITSELF, not leave it at the turn's own (terminal)
         user record — otherwise a restart re-forwards everything the agent wrote BEFORE the
         Telegram message ever joined, even though none of it should ever reach Telegram."""
@@ -543,9 +543,9 @@ class BackstopBoundaryPastEndOfFileTests(unittest.TestCase):
     """``_last_assistant_text``'s explicit ``_tg_since > size`` guard. NOTE: Python's own
     ``file.seek()``/``.read()`` already returns ``b""`` when seeking past EOF, so for THIS
     scenario removing the guard does not change the method's return value — the guard's only
-    observable effect here is the diagnostic log line (deliberately: "radši ticho s logem než
-    únik" — silence with a log beats reaching for stale content). This test pins that log, since
-    it's the only thing the mutation actually changes."""
+    observable effect here is the diagnostic log line (deliberately: silence with a log beats
+    reaching for stale content). This test pins that log, since it's the only thing the mutation
+    actually changes."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -675,6 +675,200 @@ class BackstopDoesNotReachBeforeTheTelegramBoundaryTests(unittest.TestCase):
         b._finish_turn()
 
         self.assertEqual(b.tg.sent, [(555, "Diky, uz to vidim.")])
+
+
+class TurnEndClearsTelegramOriginTests(unittest.TestCase):
+    """A turn's Telegram origin must die WITH the turn: a message typed into the tail of a
+    finishing turn is logged ONLY as a ``queued_command`` (no ``user`` record at all), so if
+    ``_finish_turn`` left the flag raised, the NEXT turn would inherit it and send everything it
+    writes to Telegram, whether or not that turn had anything to do with Telegram. Both scenarios
+    below go through ``_drain_transcript()`` + ``_finish_turn()`` — the real call sequence for an
+    authoritative turn end (Codex's ``task_complete``, Claude's Stop-hook marker). (Mutation both
+    catch: deleting ``self._turn_from_tg = False`` — and ``self._tg_since = 0`` — from
+    ``_finish_turn``.)"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.transcript = Path(self._tmp.name) / "transcript.jsonl"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_terminal_turn_after_a_queued_join_does_not_inherit_the_flag(self):
+        """Turn 1 starts from the terminal, a Telegram message JOINS it mid-flight (queued,
+        [TG]), its reply is forwarded, and the turn ends. Turn 2 is then started ONLY by a
+        queued_command with NO [TG] — no ``user`` record exists for it at all — and must stay
+        local."""
+        _write_transcript(self.transcript, [
+            _user_record("pokracuj v uklidu"),          # turn 1: terminal start
+            _attachment_record("[TG] jsi tam<"),          # Telegram joins mid-turn
+            _assistant_record("Jo, jedu dal."),           # turn 1's reply — must be forwarded
+        ])
+        b = _make_bridge_with_transcript(Path(self._tmp.name), self.transcript)
+        b._turn_active.set()
+        b._drain_transcript()
+        self.assertEqual(b.tg.sent, [(555, "Jo, jedu dal.")])
+
+        b._finish_turn()
+        self.assertFalse(b._turn_from_tg, "the flag must not survive the end of the turn")
+
+        # Turn 2: purely terminal — a queued_command with no [TG], no `user` record anywhere.
+        with open(self.transcript, "ab") as f:
+            f.write((json.dumps(_attachment_record("diky, uz mam hotovo")) + chr(10)
+                     + json.dumps(_assistant_record("Skvely, dekuji.")) + chr(10)).encode("utf-8"))
+        b._turn_active.set()
+        b._turn_text_sent = False
+
+        b._drain_transcript()
+        self.assertFalse(b._turn_from_tg,
+                          "turn 2 must not inherit turn 1's Telegram origin")
+
+        b._finish_turn()
+        self.assertEqual(b.tg.sent, [(555, "Jo, jedu dal.")],
+                          "turn 2's reply must never reach Telegram")
+
+    def test_terminal_turn_after_a_tg_turn_started_by_a_user_record_does_not_inherit_the_flag(self):
+        """Turn 1 starts from Telegram via a plain ``user`` record. Turn 2 is then started ONLY
+        by a queued_command with no [TG] — this leaked even on the pre-fix baseline, because
+        nothing there ever cleared the flag between turns at all."""
+        _write_transcript(self.transcript, [
+            _user_record("[TG] ahoj, jak to jde?"),
+            _assistant_record("Dobre, diky."),
+        ])
+        b = _make_bridge_with_transcript(Path(self._tmp.name), self.transcript)
+        b._turn_active.set()
+        b._drain_transcript()
+        self.assertEqual(b.tg.sent, [(555, "Dobre, diky.")])
+
+        b._finish_turn()
+        self.assertFalse(b._turn_from_tg)
+
+        with open(self.transcript, "ab") as f:
+            f.write((json.dumps(_attachment_record("diky, uz mam hotovo")) + chr(10)
+                     + json.dumps(_assistant_record("Skvely, dekuji.")) + chr(10)).encode("utf-8"))
+        b._turn_active.set()
+        b._turn_text_sent = False
+
+        b._drain_transcript()
+        self.assertFalse(b._turn_from_tg)
+
+        b._finish_turn()
+        self.assertEqual(b.tg.sent, [(555, "Dobre, diky.")])
+
+    def test_backstop_still_fires_before_the_flag_is_cleared(self):
+        """Counterexample to keep the reset from going too far: a Telegram turn whose reply was
+        NOT forwarded live must still get it from the backstop — which reads ``_turn_from_tg``
+        and must therefore run BEFORE the reset, not after. (Catches the reset being moved above
+        the backstop block in ``_finish_turn``, in addition to the raw deletion above: with the
+        flag cleared first, the backstop's own guard — ``self._turn_from_tg`` — would already be
+        False and it would stay silent.)"""
+        # No trailing newline on the last line — as if it was written but not yet fully flushed
+        # when the drain ran, so the live path never saw it as a complete line and never sent it.
+        _write_transcript(self.transcript, [
+            _user_record("[TG] ahoj, jak to jde?"),
+            _assistant_record("Bez marker odpoved."),
+        ], trailing_newline=False)
+
+        b = _make_bridge_with_transcript(Path(self._tmp.name), self.transcript)
+        b._turn_active.set()
+        b._drain_transcript()
+        self.assertFalse(b._turn_text_sent, "the reply must not have gone out live")
+
+        b._finish_turn()
+
+        self.assertEqual(b.tg.sent, [(555, "Bez marker odpoved.")],
+                          "the backstop must still deliver the reply")
+        self.assertFalse(b._turn_from_tg, "and the flag must be clear once it has")
+
+
+# A synthetic (NOT a real shape today) ``total_tokens_reminder`` attachment: same verbatim
+# skeleton as ``_TOTAL_TOKENS_REMINDER`` above (real transcript, line 19), with a ``prompt`` field
+# ADDED under ``attachment`` — Claude Code does not put a ``prompt`` on this attachment type as of
+# this writing. This is a forward-looking guard, not a reproduction of an observed record: it pins
+# that recognizing a queued command is ``attachment.type == "queued_command"``, never merely "has
+# a prompt field", so a future attachment type that happens to carry a ``prompt`` cannot be
+# mistaken for one.
+_TOTAL_TOKENS_REMINDER_WITH_A_PROMPT_FIELD = {
+    "parentUuid": "77777777-7777-7777-7777-777777777777",
+    "isSidechain": False,
+    "attachment": {
+        "type": "total_tokens_reminder",
+        "text": "<total_tokens>14957215 tokens left</total_tokens>",
+        "prompt": "[TG] not a real field on this attachment type as of this writing",
+    },
+    "type": "attachment",
+    "uuid": "88888888-8888-8888-8888-888888888888",
+    "timestamp": "2026-08-20T06:52:56.591Z",
+    "session_id": _SID,
+    "userType": "external",
+    "entrypoint": "cli",
+    "cwd": _CWD,
+    "sessionId": _SID,
+    "version": "2.1.235",
+    "gitBranch": "HEAD",
+}
+
+
+class OnlyQueuedCommandAttachmentsAreUserMessagesTests(unittest.TestCase):
+    """Recognizing a queued command must key off ``attachment.type == "queued_command"``, never
+    merely off the presence of a ``prompt`` field. (Mutation this catches: dropping the
+    ``attachment.type`` check in ``ClaudeCodeReader.parse()`` and reading straight off
+    ``att.get("prompt")``.)"""
+
+    def test_reader_yields_nothing_for_a_non_queued_command_attachment_with_a_prompt_field(self):
+        self.assertEqual(
+            list(ClaudeCodeReader().parse(_TOTAL_TOKENS_REMINDER_WITH_A_PROMPT_FIELD)), [])
+
+    def test_terminal_turn_stays_local_even_with_such_a_record_present(self):
+        bridge = _make_bridge(Path(tempfile.mkdtemp()))
+        reader = ClaudeCodeReader()
+
+        def feed(rec):
+            for ev in reader.parse(rec):
+                bridge._handle_event(ev)
+
+        feed(_user_record("pokracuj v uklidu"))          # terminal-started turn
+        feed(_TOTAL_TOKENS_REMINDER_WITH_A_PROMPT_FIELD)
+        self.assertFalse(bridge._turn_from_tg,
+                          "attachment.type must gate this, not the mere presence of a prompt")
+
+
+class PartialEventsSurviveATrailingMalformedBlockTests(unittest.TestCase):
+    """``_events`` yields reader output one item at a time specifically so a record that starts
+    well and then trips partway through still delivers what it already produced. Claude Code
+    records assistant TEXT before its tool_use blocks, so a broken tool_use must not cost the
+    text that came before it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.transcript = Path(self._tmp.name) / "transcript.jsonl"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_text_before_a_malformed_tool_use_block_is_still_delivered(self):
+        """(Mutation this catches: replacing ``_events``'s one-at-a-time ``yield`` with
+        ``evs = list(self._reader.parse(rec))`` inside a ``try`` — materializing the generator
+        means the ``AttributeError`` raised while formatting the broken tool call happens before
+        anything is returned, so the text already produced is discarded along with it.)"""
+        _write_transcript(self.transcript, [
+            _user_record("[TG] ukaz mi seznam souboru"),
+            {
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "Hned to spustim."},
+                    # "name": None (present but empty) — _claude_tool_summary crashes on it
+                    # (`name.startswith(...)`), simulating a malformed tool_use block.
+                    {"type": "tool_use", "id": "toolu_1", "name": None, "input": {}},
+                ]},
+            },
+        ])
+
+        b = _make_bridge_with_transcript(Path(self._tmp.name), self.transcript)
+
+        b._drain_transcript()          # must not raise
+
+        self.assertEqual(b.tg.sent, [(555, "Hned to spustim.")])
 
 
 if __name__ == "__main__":

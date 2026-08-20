@@ -303,7 +303,10 @@ class AttachBridge:
         log.info("transcript → %s", newest.name)
         self._transcript = newest
         self._tpos = 0
-        self._tg_since = 0          # an offset belongs to ONE file — it means nothing in the new one
+        # An offset belongs to ONE file and means nothing in the new one. _resume_position below
+        # normally overwrites it anyway; this makes it true even when the new transcript has no
+        # user record yet (Claude Code writes several bookkeeping records before the first one).
+        self._tg_since = 0
         self._resume_position()
 
     # ---- lifecycle ---------------------------------------------------------
@@ -355,12 +358,7 @@ class AttachBridge:
             except (json.JSONDecodeError, ValueError):
                 continue
             # Ask the reader (one definition of "a user message", shared with the live path).
-            try:
-                evs = list(self._reader.parse(rec))
-            except Exception as e:  # a malformed/foreign record must never stop the bridge starting
-                log.warning("transcript record skipped on resume (%s): %s", type(e).__name__, e)
-                continue
-            for ev in evs:
+            for ev in self._events(rec, "on resume"):
                 if ev.kind != "user" or not ev.text.strip():
                     continue
                 if ev.queued:
@@ -383,6 +381,27 @@ class AttachBridge:
             self._tpos = last_user_end
             self._turn_from_tg = from_tg
             self._tg_since = last_user_end if from_tg else 0
+
+    def _events(self, rec: dict, where: str = ""):
+        """Reader events for one transcript record, with a malformed record contained.
+
+        ONE bad record must not take anything else down with it: in the live drain ``_tpos`` has
+        already moved past the chunk, so an exception would lose every record behind it — including
+        a ``queued_command``, which is this very bug by another route; on startup it would stop the
+        bridge coming up at all. Events are yielded one at a time rather than materialized, so what
+        the reader managed to produce BEFORE it tripped is still delivered (a record carries the
+        assistant's text before its tool calls — draining it into a list would drop the answer)."""
+        it = iter(self._reader.parse(rec))
+        while True:
+            try:
+                ev = next(it)
+            except StopIteration:
+                return
+            except Exception as e:
+                log.warning("transcript record truncated%s (%s): %s",
+                            f" {where}" if where else "", type(e).__name__, e)
+                return
+            yield ev
 
     def _mark_sent(self, uuid: str) -> None:
         """Record a forwarded message uuid in memory and on disk (append-only ledger)."""
@@ -666,15 +685,19 @@ class AttachBridge:
             return None
         try:
             size = self._transcript.stat().st_size
-            # Start at the turn's Telegram boundary when we know it, so the backstop can only
-            # ever forward what the agent wrote AFTER the Telegram message entered the turn.
-            # Without this, a message queued at the very end of a terminal turn would get that
-            # turn's last sentence back as its "answer".
+            # Start at the turn's Telegram boundary when we know it, so the backstop cannot reach
+            # back into the terminal part of a turn a Telegram message merely joined: without it, a
+            # message queued at the very end of a terminal turn would get that turn's last sentence
+            # back as its "answer". The boundary is recorded when the turn's origin CHANGES, so a
+            # turn that was Telegram-originated from the start has none (0) and this falls back to
+            # the plain tail scan — which is correct there: the whole turn is forwardable.
             start = max(0, size - 2_000_000)
             if self._tg_since > size:
-                # A boundary past EOF means it belongs to a file we're no longer reading. Falling
-                # back to the plain tail scan here would forward a terminal turn's text, so stay
-                # silent — but say so, because a silent backstop is what this whole task was about.
+                # Guard, not an expected path: the boundary is only ever set to an offset at or
+                # before _tpos, and every route that shortens the file clears both. If it ever does
+                # go stale, it belongs to a file we're no longer reading — and falling back to the
+                # plain tail scan would forward a terminal turn's text. So stay silent, but SAY so:
+                # a backstop that goes quiet without a word is what this whole task was about.
                 log.warning("turn-end backstop skipped: boundary %d past EOF %d", self._tg_since, size)
                 return None
             with open(self._transcript, "rb") as f:
@@ -717,6 +740,15 @@ class AttachBridge:
         self._turn_active.clear()
         self._pending_turn_end = False
         self._consume_turn_end()
+        # A turn's Telegram origin dies WITH the turn. Leaving it raised would let it outlive the
+        # turn that earned it, and the next turn need not correct it: a message typed into the tail
+        # of a finishing turn is logged ONLY as a queued_command, with no `user` record anywhere —
+        # so a terminal turn would inherit the flag and its whole output would go to the chat.
+        # Only the authoritative ends reach here (Codex task_complete, Claude's Stop-hook marker);
+        # the 90s idle fallback deliberately does not, because it can fire while the agent is
+        # merely thinking, and clearing the flag there would silence a live Telegram turn.
+        self._turn_from_tg = False
+        self._tg_since = 0
         if was_active:
             log.info("TURN END t=%.2f dur=%.1fs typing_fired=%d max_gap=%.2fs",
                      time.time(), time.monotonic() - self._turn_started,
@@ -855,16 +887,7 @@ class AttachBridge:
             except json.JSONDecodeError:
                 continue
             was_from_tg = self._turn_from_tg
-            try:
-                # Same guard as _resume_position: ONE malformed/foreign record must not abort the
-                # whole chunk. _tpos has already moved past it, so the rest of the chunk would
-                # never be read again — including a queued_command further down, which would
-                # reproduce this very bug by another route.
-                evs = list(self._reader.parse(rec))
-            except Exception as e:
-                log.warning("transcript record skipped (%s): %s", type(e).__name__, e)
-                continue
-            for ev in evs:
+            for ev in self._events(rec):
                 self._handle_event(ev)
             if self._turn_from_tg != was_from_tg:
                 # The turn's Telegram origin changed HERE — record (or drop) the boundary the
