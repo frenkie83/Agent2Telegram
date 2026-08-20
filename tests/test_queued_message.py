@@ -41,7 +41,7 @@ _QUEUE_ENQUEUE = {
     "operation": "enqueue",
     "timestamp": "2026-08-20T06:53:09.329Z",
     "sessionId": _SID,
-    "content": "[TG] jsi tam<",
+    "content": "[TG] are you there<",
 }
 
 # Real transcript, line 49: type=queue-operation / remove — written once the queued text is
@@ -51,7 +51,7 @@ _QUEUE_REMOVE = {
     "operation": "remove",
     "timestamp": "2026-08-20T06:53:13.774Z",
     "sessionId": _SID,
-    "content": "[TG] jsi tam<",
+    "content": "[TG] are you there<",
 }
 
 # Real transcript, line 51: type=attachment / attachment.type=queued_command — the record the
@@ -252,20 +252,20 @@ class QueuedMessageMidTurnTests(unittest.TestCase):
         self.assertFalse(self.bridge._turn_from_tg)
 
         # The Telegram message actually joins the running turn here.
-        self._feed(_attachment_record("[TG] jsi tam<"))
+        self._feed(_attachment_record("[TG] are you there<"))
         self.assertTrue(self.bridge._turn_from_tg)
 
         # The turn's answer must now be forwarded.
-        self.bridge._handle_event(Ev("text", text="Jo, jedu dál.", key="reply-1"))
-        self.assertEqual(self.bridge.tg.sent, [(555, "Jo, jedu dál.")])
+        self.bridge._handle_event(Ev("text", text="Yep, still going.", key="reply-1"))
+        self.assertEqual(self.bridge.tg.sent, [(555, "Yep, still going.")])
 
     def test_tg_turn_start_still_forwards_reply_regression(self):
         """Criterion 2 — the classic path (a turn that STARTS from Telegram) must keep working."""
-        self._feed(_user_record("[TG] ok, takže teď už vše běží?"))
+        self._feed(_user_record("[TG] ok, is everything running now?"))
         self.assertTrue(self.bridge._turn_from_tg)
 
-        self.bridge._handle_event(Ev("text", text="Ano, běží.", key="reply-2"))
-        self.assertEqual(self.bridge.tg.sent, [(555, "Ano, běží.")])
+        self.bridge._handle_event(Ev("text", text="Yes, it is running.", key="reply-2"))
+        self.assertEqual(self.bridge.tg.sent, [(555, "Yes, it is running.")])
 
     def test_terminal_only_turn_is_never_forwarded(self):
         """Criterion 3 — a turn nobody from Telegram touched stays local."""
@@ -279,7 +279,7 @@ class QueuedMessageMidTurnTests(unittest.TestCase):
         """Criterion 5 (reverse direction) — a turn that started from Telegram, then someone at
         the terminal types into it while it's running (no [TG] prefix, queued). The flag may
         only be ADDED, never cleared: the turn's reply must still go out."""
-        self._feed(_user_record("[TG] ok, takže teď už vše běží?"))
+        self._feed(_user_record("[TG] ok, is everything running now?"))
         self.assertTrue(self.bridge._turn_from_tg)
 
         # Same verbatim attachment shape as the real line 51, but the prompt has no [TG] — a
@@ -317,17 +317,17 @@ class QueuedMessageMidTurnTests(unittest.TestCase):
         any turn in a session touched Telegram, every later terminal-only turn would leak too.
         (Mutation this catches: replacing the non-queued branch's plain assignment with
         ``self._turn_from_tg = self._turn_from_tg or from_tg`` for every 'user' event.)"""
-        self._feed(_user_record("[TG] ok, takže teď už vše běží?"))
+        self._feed(_user_record("[TG] ok, is everything running now?"))
         self.assertTrue(self.bridge._turn_from_tg)
-        self.bridge._handle_event(Ev("text", text="Ano, běží.", key="tg-reply"))
-        self.assertEqual(self.bridge.tg.sent, [(555, "Ano, běží.")])
+        self.bridge._handle_event(Ev("text", text="Yes, it is running.", key="tg-reply"))
+        self.assertEqual(self.bridge.tg.sent, [(555, "Yes, it is running.")])
 
         # A brand new turn starts from the terminal — not queued, no [TG].
         self._feed(_user_record("dalsi ukol, tentokrat z terminalu"))
         self.assertFalse(self.bridge._turn_from_tg)
 
-        self.bridge._handle_event(Ev("text", text="Hotovo lokálně.", key="term-reply"))
-        self.assertEqual(self.bridge.tg.sent, [(555, "Ano, běží.")],
+        self.bridge._handle_event(Ev("text", text="Done locally.", key="term-reply"))
+        self.assertEqual(self.bridge.tg.sent, [(555, "Yes, it is running.")],
                           "the terminal turn's reply must not leak to Telegram")
 
     def test_queued_message_without_tg_prefix_into_terminal_turn_stays_local(self):
@@ -379,7 +379,7 @@ class ResumePositionQueuedMessageTests(unittest.TestCase):
         Telegram message ever joined, even though none of it should ever reach Telegram."""
         offsets = _write_transcript(self.transcript, [
             _user_record("pokracuj v uklidu"),             # terminal-started turn — offsets[0]
-            _attachment_record("[TG] jsi tam<"),            # TG joins mid-turn    — offsets[1]
+            _attachment_record("[TG] are you there<"),            # TG joins mid-turn    — offsets[1]
         ])
 
         b = self._resumed_bridge()
@@ -395,8 +395,8 @@ class ResumePositionQueuedMessageTests(unittest.TestCase):
         user record and the queued line still belongs to the turn and must be re-read (and
         forwarded) after a restart, not skipped."""
         offsets = _write_transcript(self.transcript, [
-            _user_record("[TG] ok, takže teď už vše běží?"),   # starts as a TG turn — offsets[0]
-            _assistant_record("Mezitím pracuju dál."),          # written while the turn runs
+            _user_record("[TG] ok, is everything running now?"),   # starts as a TG turn — offsets[0]
+            _assistant_record("Still working in the meantime."),          # written while the turn runs
             _attachment_record("diky, uz to vidim"),             # terminal message queued, no [TG]
         ])
 
@@ -414,8 +414,8 @@ class ResumePositionQueuedMessageTests(unittest.TestCase):
         assigning ``from_tg = ev.text.lstrip().startswith(self._origins)`` unconditionally
         instead of only ever raising it.)"""
         _write_transcript(self.transcript, [
-            _user_record("[TG] ok, takže teď už vše běží?"),
-            _assistant_record("Mezitím pracuju dál."),
+            _user_record("[TG] ok, is everything running now?"),
+            _assistant_record("Still working in the meantime."),
             _attachment_record("diky, uz to vidim"),          # no [TG] — queued from the terminal
         ])
 
@@ -430,7 +430,7 @@ class ResumePositionQueuedMessageTests(unittest.TestCase):
         elsewhere in the scanned window must still be recovered. (Mutation this catches: removing
         the try/except around the ``parse()`` call in ``_resume_position``.)"""
         _write_transcript(self.transcript, [
-            _user_record("[TG] ok, takže teď už vše běží?"),
+            _user_record("[TG] ok, is everything running now?"),
             _BROKEN_ASSISTANT_RECORD,
         ])
 
@@ -475,7 +475,7 @@ class ResumeAloneSetsTheBackstopBoundaryTests(unittest.TestCase):
         _write_transcript(self.transcript, [
             _user_record("pokracuj v uklidu"),                      # terminal-started turn
             _assistant_record("Nasel jsem heslo v .env: hunter2"),  # MUST stay local
-            _attachment_record("[TG] jsi tam<"),                    # TG joins mid-turn, no reply yet
+            _attachment_record("[TG] are you there<"),                    # TG joins mid-turn, no reply yet
         ])
 
         b = _make_bridge_with_transcript(Path(self._tmp.name), self.transcript)
@@ -511,7 +511,7 @@ class TranscriptRotationResetsTheBackstopBoundaryTests(unittest.TestCase):
         # Turn 1: a TG turn, padded so the file is bigger than turn 2's file below — this is
         # what makes `size < self._tpos` trip on the switch.
         _write_transcript(self.transcript, [
-            _user_record("[TG] prvni dotaz, hodne dlouhy text kolem dokola, aby soubor byl vetsi"),
+            _user_record("[TG] first question, a long-winded text so the file gets bigger"),
             _assistant_record("Odpoved na prvni dotaz."),
         ])
         b = _make_bridge_with_transcript(Path(self._tmp.name), self.transcript)
@@ -522,7 +522,7 @@ class TranscriptRotationResetsTheBackstopBoundaryTests(unittest.TestCase):
         # exact condition _drain_transcript checks for (`size < self._tpos`). Last line has no
         # trailing newline, so the live drain doesn't pick up the reply — only the backstop can.
         _write_transcript(self.transcript, [
-            _user_record("[TG] druhy dotaz"),
+            _user_record("[TG] second question"),
             _assistant_record("Odpoved na druhy dotaz."),
         ], trailing_newline=False)
 
@@ -588,7 +588,7 @@ class LiveDrainSkipsMalformedRecordsTests(unittest.TestCase):
         _write_transcript(self.transcript, [
             _user_record("pokracuj v uklidu"),          # terminal-started turn
             _BROKEN_ASSISTANT_RECORD,                     # malformed — must be skipped, not fatal
-            _attachment_record("[TG] jsi tam<"),          # TG joins mid-turn, further down the chunk
+            _attachment_record("[TG] are you there<"),          # TG joins mid-turn, further down the chunk
             _assistant_record("odpoved"),
         ])
 
@@ -615,7 +615,7 @@ class ResumeThenDrainDoesNotLeakContentBeforeTheQueuedMessageTests(unittest.Test
         _write_transcript(self.transcript, [
             _user_record("pokracuj v uklidu"),                             # terminal start
             _assistant_record("Nasel jsem heslo v .env: hunter2"),         # MUST stay local
-            _attachment_record("[TG] jsi tam<"),                           # TG joins mid-turn
+            _attachment_record("[TG] are you there<"),                           # TG joins mid-turn
             _assistant_record("Jo, jedu dal."),                            # MUST be forwarded
         ])
 
@@ -645,7 +645,7 @@ class BackstopDoesNotReachBeforeTheTelegramBoundaryTests(unittest.TestCase):
         _write_transcript(self.transcript, [
             _user_record("pokracuj v uklidu"),
             _assistant_record("Nasel jsem heslo v .env: hunter2"),
-            _attachment_record("[TG] jsi tam<"),           # agent hasn't answered it yet
+            _attachment_record("[TG] are you there<"),           # agent hasn't answered it yet
         ])
 
         b = _make_bridge_with_transcript(Path(self._tmp.name), self.transcript)
@@ -663,7 +663,7 @@ class BackstopDoesNotReachBeforeTheTelegramBoundaryTests(unittest.TestCase):
         _write_transcript(self.transcript, [
             _user_record("pokracuj v uklidu"),
             _assistant_record("Nasel jsem heslo v .env: hunter2"),
-            _attachment_record("[TG] jsi tam<"),
+            _attachment_record("[TG] are you there<"),
             _assistant_record("Diky, uz to vidim."),
         ], trailing_newline=False)
 
@@ -701,7 +701,7 @@ class TurnEndClearsTelegramOriginTests(unittest.TestCase):
         local."""
         _write_transcript(self.transcript, [
             _user_record("pokracuj v uklidu"),          # turn 1: terminal start
-            _attachment_record("[TG] jsi tam<"),          # Telegram joins mid-turn
+            _attachment_record("[TG] are you there<"),          # Telegram joins mid-turn
             _assistant_record("Jo, jedu dal."),           # turn 1's reply — must be forwarded
         ])
         b = _make_bridge_with_transcript(Path(self._tmp.name), self.transcript)
@@ -732,7 +732,7 @@ class TurnEndClearsTelegramOriginTests(unittest.TestCase):
         by a queued_command with no [TG] — this leaked even on the pre-fix baseline, because
         nothing there ever cleared the flag between turns at all."""
         _write_transcript(self.transcript, [
-            _user_record("[TG] ahoj, jak to jde?"),
+            _user_record("[TG] hi, how is it going?"),
             _assistant_record("Dobre, diky."),
         ])
         b = _make_bridge_with_transcript(Path(self._tmp.name), self.transcript)
@@ -765,7 +765,7 @@ class TurnEndClearsTelegramOriginTests(unittest.TestCase):
         # No trailing newline on the last line — as if it was written but not yet fully flushed
         # when the drain ran, so the live path never saw it as a complete line and never sent it.
         _write_transcript(self.transcript, [
-            _user_record("[TG] ahoj, jak to jde?"),
+            _user_record("[TG] hi, how is it going?"),
             _assistant_record("Bez marker odpoved."),
         ], trailing_newline=False)
 
@@ -852,7 +852,7 @@ class PartialEventsSurviveATrailingMalformedBlockTests(unittest.TestCase):
         means the ``AttributeError`` raised while formatting the broken tool call happens before
         anything is returned, so the text already produced is discarded along with it.)"""
         _write_transcript(self.transcript, [
-            _user_record("[TG] ukaz mi seznam souboru"),
+            _user_record("[TG] show me the file list"),
             {
                 "type": "assistant",
                 "message": {"content": [
