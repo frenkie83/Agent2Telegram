@@ -18,6 +18,7 @@ import glob
 import html
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -139,6 +140,12 @@ class AttachBridge:
         self._tpos = 0
         self._turn_active = threading.Event()
         self._turn_from_tg = False           # is the current transcript turn Telegram-originated?
+        # Byte offset in the transcript where THIS turn's Telegram-forwardable content begins.
+        # For a turn that starts from Telegram that's right after its user record; for a turn a
+        # Telegram message JOINED mid-flight it's right after the queued record — everything the
+        # agent wrote before that belongs to the terminal part of the turn and must stay local.
+        # 0 = no boundary known (fall back to the plain tail scan, the pre-2026-08-20 behaviour).
+        self._tg_since = 0
         self._last_activity = 0.0            # monotonic ts of last transcript activity (for typing)
         self._status = {"mid": None, "shown": ""}   # live one-line tool-call status bubble
         self._last_typing = 0.0                      # monotonic ts of last "typing…" chat action
@@ -166,6 +173,12 @@ class AttachBridge:
         files: list[str] = []
         for pat in (patterns or ("*.jsonl",)):
             files = glob.glob(str(base / "**" / pat), recursive=True)
+            # Claude Code píše záznamy subagentů do <konverzace>/subagents/. Ty sem nepatří:
+            # subagent (architect, tester, reviewer) zapisuje mnohem častěji než hlavní
+            # konverzace, takže by vyhrál na mtime a most by se přepnul na něj — a shrnutí,
+            # které agent napíše uživateli, by neodešlo nikam. Přesně tímhle přestalo chodit
+            # echo o dokončené práci (2026-08-11).
+            files = [f for f in files if f"{os.sep}subagents{os.sep}" not in f]
             if files:
                 break
         if not files:
@@ -290,6 +303,10 @@ class AttachBridge:
         log.info("transcript → %s", newest.name)
         self._transcript = newest
         self._tpos = 0
+        # An offset belongs to ONE file and means nothing in the new one. _resume_position below
+        # normally overwrites it anyway; this makes it true even when the new transcript has no
+        # user record yet (Claude Code writes several bookkeeping records before the first one).
+        self._tg_since = 0
         self._resume_position()
 
     # ---- lifecycle ---------------------------------------------------------
@@ -340,13 +357,51 @@ class AttachBridge:
                 rec = json.loads(raw.decode("utf-8", "ignore"))
             except (json.JSONDecodeError, ValueError):
                 continue
-            utext = self._reader.user_text(rec)
-            if utext and utext.strip():
-                from_tg = utext.lstrip().startswith(self._origins)
+            # Ask the reader (one definition of "a user message", shared with the live path).
+            for ev in self._events(rec, "on resume"):
+                if ev.kind != "user" or not ev.text.strip():
+                    continue
+                if ev.queued:
+                    # Joined a turn that was already running, so it may only ADD Telegram origin.
+                    if from_tg or not ev.text.lstrip().startswith(self._origins):
+                        continue
+                    # It RAISED the flag: everything the agent wrote before this point belongs to
+                    # the pre-Telegram part of the turn and must NOT be forwarded — so the rewind
+                    # point moves to just after this record, not back to the turn's own start.
+                    # Known limit: the boundary is the PICKUP, not the enqueue. Text the agent
+                    # writes in between (Claude logs enqueue first, the attachment on pickup) stays
+                    # local. That's the price of never leaking a terminal turn, and it's the safe
+                    # side of the trade.
+                    from_tg = True
+                    last_user_end = min(line_end, size)
+                    continue
+                from_tg = ev.text.lstrip().startswith(self._origins)
                 last_user_end = min(line_end, size)
         if last_user_end is not None:
             self._tpos = last_user_end
             self._turn_from_tg = from_tg
+            self._tg_since = last_user_end if from_tg else 0
+
+    def _events(self, rec: dict, where: str = ""):
+        """Reader events for one transcript record, with a malformed record contained.
+
+        ONE bad record must not take anything else down with it: in the live drain ``_tpos`` has
+        already moved past the chunk, so an exception would lose every record behind it — including
+        a ``queued_command``, which is this very bug by another route; on startup it would stop the
+        bridge coming up at all. Events are yielded one at a time rather than materialized, so what
+        the reader managed to produce BEFORE it tripped is still delivered (a record carries the
+        assistant's text before its tool calls — draining it into a list would drop the answer)."""
+        it = iter(self._reader.parse(rec))
+        while True:
+            try:
+                ev = next(it)
+            except StopIteration:
+                return
+            except Exception as e:
+                log.warning("transcript record truncated%s (%s): %s",
+                            f" {where}" if where else "", type(e).__name__, e)
+                return
+            yield ev
 
     def _mark_sent(self, uuid: str) -> None:
         """Record a forwarded message uuid in memory and on disk (append-only ledger)."""
@@ -630,8 +685,23 @@ class AttachBridge:
             return None
         try:
             size = self._transcript.stat().st_size
+            # Start at the turn's Telegram boundary when we know it, so the backstop cannot reach
+            # back into the terminal part of a turn a Telegram message merely joined: without it, a
+            # message queued at the very end of a terminal turn would get that turn's last sentence
+            # back as its "answer". The boundary is recorded when the turn's origin CHANGES, so a
+            # turn that was Telegram-originated from the start has none (0) and this falls back to
+            # the plain tail scan — which is correct there: the whole turn is forwardable.
+            start = max(0, size - 2_000_000)
+            if self._tg_since > size:
+                # Guard, not an expected path: the boundary is only ever set to an offset at or
+                # before _tpos, and every route that shortens the file clears both. If it ever does
+                # go stale, it belongs to a file we're no longer reading — and falling back to the
+                # plain tail scan would forward a terminal turn's text. So stay silent, but SAY so:
+                # a backstop that goes quiet without a word is what this whole task was about.
+                log.warning("turn-end backstop skipped: boundary %d past EOF %d", self._tg_since, size)
+                return None
             with open(self._transcript, "rb") as f:
-                f.seek(max(0, size - 2_000_000))
+                f.seek(max(start, self._tg_since))
                 tail = f.read()
         except OSError:
             return None
@@ -670,6 +740,15 @@ class AttachBridge:
         self._turn_active.clear()
         self._pending_turn_end = False
         self._consume_turn_end()
+        # A turn's Telegram origin dies WITH the turn. Leaving it raised would let it outlive the
+        # turn that earned it, and the next turn need not correct it: a message typed into the tail
+        # of a finishing turn is logged ONLY as a queued_command, with no `user` record anywhere —
+        # so a terminal turn would inherit the flag and its whole output would go to the chat.
+        # Only the authoritative ends reach here (Codex task_complete, Claude's Stop-hook marker);
+        # the 90s idle fallback deliberately does not, because it can fire while the agent is
+        # merely thinking, and clearing the flag there would silence a live Telegram turn.
+        self._turn_from_tg = False
+        self._tg_since = 0
         if was_active:
             log.info("TURN END t=%.2f dur=%.1fs typing_fired=%d max_gap=%.2fs",
                      time.time(), time.monotonic() - self._turn_started,
@@ -786,6 +865,7 @@ class AttachBridge:
         size = self._transcript.stat().st_size
         if size < self._tpos:          # file rotated/truncated
             self._tpos = 0
+            self._tg_since = 0         # both cursors are offsets into the old, longer file
         if size == self._tpos:
             return
         with open(self._transcript, "rb") as f:
@@ -795,8 +875,10 @@ class AttachBridge:
         nl = chunk.rfind(b"\n")
         if nl == -1:
             return
+        off = self._tpos                     # byte offset of the first line in this chunk
         self._tpos += nl + 1
         for raw in chunk[:nl].split(b"\n"):
+            off += len(raw) + 1              # byte offset just past this line
             line = raw.decode("utf-8", "ignore").strip()
             if not line:
                 continue
@@ -804,8 +886,13 @@ class AttachBridge:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            for ev in self._reader.parse(rec):
+            was_from_tg = self._turn_from_tg
+            for ev in self._events(rec):
                 self._handle_event(ev)
+            if self._turn_from_tg != was_from_tg:
+                # The turn's Telegram origin changed HERE — record (or drop) the boundary the
+                # turn-end backstop must not reach back past.
+                self._tg_since = off if self._turn_from_tg else 0
         # Any new transcript content during a Telegram turn = the agent is still working;
         # refresh activity so the idle fallback doesn't fire prematurely.
         if self._turn_from_tg:
@@ -828,7 +915,16 @@ class AttachBridge:
         if ev.kind == "user":
             # Remember whether this turn came from Telegram (origin prefix) — only those are
             # forwarded; terminal-originated turns stay local.
-            self._turn_from_tg = ev.text.lstrip().startswith(self._origins)
+            from_tg = ev.text.lstrip().startswith(self._origins)
+            # A queued message joins a turn that is already running, so it may only ADD
+            # Telegram origin, never clear it: a terminal message typed into a Telegram turn
+            # must not silence that turn's reply (the same bug, mirrored).
+            if ev.queued:
+                if from_tg and not self._turn_from_tg:
+                    log.info("TURN JOINED by a queued Telegram message -> forwarding this turn")
+                self._turn_from_tg = self._turn_from_tg or from_tg
+            else:
+                self._turn_from_tg = from_tg
             return
         if ev.kind == "turn_start":
             return                              # inbound already lit typing; nothing else to do
