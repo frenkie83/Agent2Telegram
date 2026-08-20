@@ -7,7 +7,10 @@ on-disk transcript format of one agent and maps its records to a common set of e
   ``turn_start`` — a new turn began. Codex writes ``task_started``; Claude Code has no such
                    record, so for it the bridge starts the turn from the inbound message.
   ``user``       — a user message (``Ev.text``). Used to detect whether the turn came from
-                   Telegram (origin prefix) so only those turns are forwarded.
+                   Telegram (origin prefix) so only those turns are forwarded. ``Ev.queued``
+                   marks a message typed into a turn that was already running: it JOINS the
+                   turn instead of starting one, so it may only ADD Telegram origin, never
+                   take it away.
   ``text``       — assistant text to forward as a kept progress/final message. ``Ev.key`` is a
                    stable dedup id; ``Ev.final`` hints this is the final answer.
   ``tool``       — a tool/command call, summarized for the one-line status bubble. ``Ev.key`` is
@@ -35,6 +38,7 @@ class Ev:
     text: str = ""          # message / tool-summary text
     key: str = ""           # stable dedup id (text uuid/hash, tool call id)
     final: bool = False      # for 'text': hint that this is the final answer
+    queued: bool = False     # for 'user': typed INTO a turn already running (joins it, doesn't start it)
 
 
 def _short(s: str, n: int = 58) -> str:
@@ -90,17 +94,29 @@ class ClaudeCodeReader:
     name = "claude-code"
     emits_turn_end = False
 
-    def user_text(self, rec: dict) -> str | None:
-        if rec.get("type") != "user":
-            return None
-        return _text_of(rec.get("message", {}).get("content"))
-
     def parse(self, rec: dict):
         typ = rec.get("type")
         if typ == "user":
             t = _text_of(rec.get("message", {}).get("content"))
             if t.strip():
                 yield Ev("user", text=t)
+            return
+        if typ == "attachment":
+            # A message typed while a turn is ALREADY RUNNING is never written as a `user`
+            # record — Claude Code queues it and logs it as an attachment once the running turn
+            # picks it up. Without this the bridge saw no user message at all for such a turn,
+            # so a Telegram message sent mid-turn got an answer that was silently dropped
+            # (2026-08-20). We key off the attachment rather than the earlier
+            # `queue-operation`/`enqueue` line for two reasons: enqueue and its `remove` twin
+            # carry the identical text, so a message the user deletes from the queue before it
+            # runs is indistinguishable from one that ran; and the attachment is written at the
+            # moment the text actually enters the turn, which is the fact we care about.
+            att = rec.get("attachment")
+            att = att if isinstance(att, dict) else {}
+            if att.get("type") == "queued_command":
+                t = att.get("prompt") or ""
+                if t.strip():
+                    yield Ev("user", text=t, queued=True)
             return
         if typ != "assistant":
             return
@@ -159,12 +175,6 @@ class CodexReader:
 
     name = "codex"
     emits_turn_end = True
-
-    def user_text(self, rec: dict) -> str | None:
-        p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
-        if rec.get("type") == "event_msg" and p.get("type") == "user_message":
-            return p.get("message", "")
-        return None
 
     def parse(self, rec: dict):
         t = rec.get("type")
