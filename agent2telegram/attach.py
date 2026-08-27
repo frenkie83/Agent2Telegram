@@ -566,13 +566,32 @@ class AttachBridge:
         text = (msg.get("text") or msg.get("caption") or "").strip()
         if msg.get("voice") or msg.get("audio"):
             text = self._transcribe(msg.get("voice") or msg.get("audio"), chat_id) or text
-            if not text:
-                return
         elif msg.get("photo") or msg.get("document"):
             note = self._download_note(msg, chat_id)
             text = f"{text}\n{note}".strip() if note else text
-        if text:
-            self._inject(text)
+
+        if not text:
+            # A message arrived, the turn was already marked active and "typing…" is lit —
+            # but there is nothing to hand the agent. Returning silently is the worst option:
+            # the indicator goes dark with no reply and it looks like the agent ignored you.
+            #
+            # ⛔ Measured 2026-08-26: a voice note produced TURN START 23:11:29 →
+            # TURN END 23:11:59 with no FWD in between. Transcription raised nothing (no
+            # "transcription failed" in the log), it just came back empty, so `_inject` was
+            # never called and the agent NEVER SAW the message. From the user's side it was
+            # indistinguishable from being ignored.
+            self._turn_active.clear()
+            self._consume_turn_end()
+            kind = "hlasovka" if (msg.get("voice") or msg.get("audio")) else "zpráva"
+            self.tg.send_message(
+                chat_id,
+                f"\u26a0\ufe0f Tahle {kind} dorazila prázdná — přepis nic nevrátil, "
+                "takže se k agentovi vůbec nedostala. Zkus ji poslat znovu, nebo napiš textem.")
+            log.warning("inbound message produced no text (voice=%s) -> user notified, turn cleared",
+                        bool(msg.get("voice") or msg.get("audio")))
+            return
+
+        self._inject(text)
 
     def _inject(self, text: str) -> None:
         self._turn_active.set()
@@ -913,6 +932,16 @@ class AttachBridge:
     def _handle_event(self, ev) -> None:
         """Apply one normalized reader event to the Telegram side."""
         if ev.kind == "user":
+            # ⛔ A tool RESULT is written to the transcript with role "user" and no text.
+            # It is not a message from a human and must never touch the turn's origin.
+            #
+            # Measured 2026-08-26: "[TG] Text 3" arrived at 23:28:19, a tool result landed as
+            # an empty user event at 23:28:25, and the reply at 23:28:58 was NEVER forwarded —
+            # the empty event had reset `_turn_from_tg` to False, which also disarmed the
+            # end-of-turn backstop (it tests the same flag). Symptom: replies arrive only when
+            # the agent answers WITHOUT looking anything up, so it looks random.
+            if not ev.text.strip():
+                return
             # Remember whether this turn came from Telegram (origin prefix) — only those are
             # forwarded; terminal-originated turns stay local.
             from_tg = ev.text.lstrip().startswith(self._origins)
