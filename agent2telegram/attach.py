@@ -948,12 +948,23 @@ class AttachBridge:
             # A queued message joins a turn that is already running, so it may only ADD
             # Telegram origin, never clear it: a terminal message typed into a Telegram turn
             # must not silence that turn's reply (the same bug, mirrored).
-            if ev.queued:
-                if from_tg and not self._turn_from_tg:
-                    log.info("TURN JOINED by a queued Telegram message -> forwarding this turn")
-                self._turn_from_tg = self._turn_from_tg or from_tg
-            else:
-                self._turn_from_tg = from_tg
+            # ⛔ Within a turn the origin flag is only ever RAISED, never cleared — for queued
+            # and non-queued events alike. The flag is reset in `_finish_turn` (see there), so a
+            # terminal-originated turn starts False and stays False; nothing is forwarded for it.
+            #
+            # ⚠️ Why never clear: Claude Code writes every tool RESULT to the transcript with
+            # role "user". Those records are NOT human messages and do not carry the `[TG]`
+            # marker, so treating them as origin evidence silently turned Telegram turns into
+            # local ones — and disarmed the end-of-turn backstop too (it tests the same flag).
+            #
+            # Measured twice. 2026-08-26 23:28 with an EMPTY tool result; the first fix only
+            # skipped empty ones, which was patching the special case instead of the cause —
+            # a tool result normally carries the command output, is non-empty, and cleared the
+            # flag exactly the same way (2026-08-27 17:11, same symptom, fix in place).
+            if from_tg and not self._turn_from_tg:
+                log.info("TURN %s by a Telegram message -> forwarding this turn",
+                         "JOINED" if ev.queued else "STARTED")
+            self._turn_from_tg = self._turn_from_tg or from_tg
             return
         if ev.kind == "turn_start":
             return                              # inbound already lit typing; nothing else to do
