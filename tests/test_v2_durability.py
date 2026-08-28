@@ -311,7 +311,10 @@ class TurnEndBackstopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             b = _bridge(td)
             finished = []
-            b._finish_turn = lambda: finished.append(True)
+            # `*a, **k`: _finish_turn takes a `definitive` keyword — an idle end must run
+            # the backstop (what this test measures) but must NOT lower the turn's
+            # Telegram origin, because silence is not the end of the agent's work.
+            b._finish_turn = lambda *a, **k: finished.append(True)
             for name in ("_maybe_reresolve", "_flush_pending", "_drain_transcript",
                          "_drain_signal", "_beat", "_status_clear"):
                 setattr(b, name, lambda *a, **k: None)
