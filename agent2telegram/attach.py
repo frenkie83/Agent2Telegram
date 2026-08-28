@@ -549,6 +549,10 @@ class AttachBridge:
         if last_user_end is not None:
             self._tpos = last_user_end
             self._turn_from_tg = from_tg
+            # The origin is being restored from the transcript, so the boundary that goes with it
+            # has to be too — otherwise the backstop after a restart is free to reach back into
+            # whatever preceded that message.
+            self._tg_since = last_user_end if from_tg else 0
 
     def _mark_sent(self, uuid: str) -> bool:
         """Record a delivered message uuid in memory and on disk. Returns whether the disk write
@@ -1307,6 +1311,10 @@ class AttachBridge:
         # joining it must not hide an answer to the first one that has not been forwarded yet.
         if not (self._turn_active.is_set() and self._turn_from_tg):
             self._tg_since = self._transcript_size()
+        # Which turn this is. _finish_turn runs on the OUTBOUND thread and can sit in the backstop
+        # for over a second; the inbound thread can start a new turn inside that window, and
+        # without this the finishing thread would wipe the NEW turn's origin on its way out.
+        self._turn_seq = getattr(self, "_turn_seq", 0) + 1
         self._turn_active.set()
         self._turn_from_tg = True
         self._last_activity = now
@@ -1716,8 +1724,14 @@ class AttachBridge:
         return (getattr(self, "_transcript", None) is not None
                 or getattr(self, "_signal", None) is not None)
 
-    def _finish_turn(self) -> None:
-        """Drop the technical bubble and stop the typing indicator at the real end of a turn."""
+    def _finish_turn(self, *, definitive: bool = True) -> None:
+        """Drop the technical bubble and stop the typing indicator at the real end of a turn.
+
+        ``definitive`` says whether the turn really ENDED or was merely closed because nothing had
+        happened for a while. Only an authoritative end (Claude's Stop-hook marker, Codex's
+        task_complete) may lower the Telegram origin — see the guard at the bottom.
+        """
+        seq_at_entry = getattr(self, "_turn_seq", 0)
         self._status_clear()
         was_active = self._turn_active.is_set()
         from_tg_at_end = self._turn_from_tg
@@ -1771,14 +1785,24 @@ class AttachBridge:
             # lost reply would look exactly the same in the daily traffic analysis.
             log.info("TURN END reaction turn without a reply (backstop deliberately skipped)")
         self._turn_active.clear()
-        # A turn's Telegram origin DIES WITH THE TURN. Leaving it raised was not cosmetic: a
+        # A turn's Telegram origin DIES WITH AN ENDED TURN. Leaving it raised was not cosmetic: a
         # message typed into the tmux pane while a turn is finishing gets QUEUED by Claude Code
         # and lands in the transcript only as `attachment`/`queued_command`, which the reader
         # ignores — so no `user` record ever arrives to lower the flag, and the whole output of
         # that purely local turn is forwarded to Telegram. Not a lost reply this time but the
         # reverse: terminal session content leaking into the chat.
-        self._turn_from_tg = False
-        self._tg_since = 0
+        #
+        # ⛔ BOTH conditions are load-bearing, and each of them is a lost reply if dropped:
+        #   * `definitive` — the 90 s idle fallback and a stale end-of-turn signal also land here,
+        #     and BOTH fire while the agent is still working (a build, a full test run, anything
+        #     that writes nothing to the transcript for a minute and a half). Lowering the origin
+        #     there means the answer the agent writes afterwards is silently dropped: no log line,
+        #     no backstop, and the turn already logged itself as answered.
+        #   * the sequence check — a turn that began while this one was finishing owns the flag
+        #     now, and must not have it taken away by the thread on its way out.
+        if definitive and getattr(self, "_turn_seq", 0) == seq_at_entry:
+            self._turn_from_tg = False
+            self._tg_since = 0
         self._pending_turn_end = False
         self._consume_turn_end()
         if was_active:
@@ -1791,10 +1815,10 @@ class AttachBridge:
                      self._typing_count, self._max_gap, from_tg_at_end, text_sent_at_end,
                      reaction_at_end)
 
-    def _end_turn(self) -> None:
+    def _end_turn(self, *, definitive: bool = True) -> None:
         # Claude Stop-hook path: catch anything written just before the hook fired, then finish.
         self._drain_transcript()
-        self._finish_turn()
+        self._finish_turn(definitive=definitive)
 
 
     def _outbound_loop(self) -> None:
@@ -1815,7 +1839,11 @@ class AttachBridge:
                         log.warning("turn ending after %.1fs — suspiciously fast, a stale "
                                     "end-of-turn signal is the usual cause",
                                     time.monotonic() - zacatek)
-                    self._finish_turn()
+                        # Already judged not to be this turn's real end, so it does not get to
+                        # lower the Telegram origin either — the agent is still working.
+                        self._finish_turn(definitive=False)
+                    else:
+                        self._finish_turn()
                 elif self._turn_end is not None and self._turn_end.exists():
                     self._end_turn()
                 elif self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
@@ -1826,7 +1854,10 @@ class AttachBridge:
                     # distinguishes "ended in silence" from "the hook reported it".
                     log.warning("konec turnu podle ticha (%.0f s bez aktivity), hook se neozval",
                                 IDLE_DONE)
-                    self._end_turn()
+                    # NOT definitive: silence is not an end. A long build or test run writes
+                    # nothing to the transcript for well over 90 s, and the agent answers when it
+                    # comes back — that answer must still be forwarded.
+                    self._end_turn(definitive=False)
                 # Live retry: messages that failed to deliver are retried while running too.
                 # Replay only at startup meant, for a long-running service, waiting forever.
                 if time.monotonic() - getattr(self, "_last_inbound_retry", 0.0) > INBOUND_RETRY_INTERVAL:
