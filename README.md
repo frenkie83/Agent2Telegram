@@ -138,6 +138,7 @@ from Telegram.
 | `/status` | which agent + tmux session you're connected to (and whether voice is on) |
 | `/setkey <key>` | enable voice transcription with your ElevenLabs key — your message is deleted right after so the key isn't left in the chat |
 | `/voice` | toggle spoken replies — the agent's answer comes back as a voice note (needs an ElevenLabs key) |
+| `zapni hlas` / `vypni hlas` | the same switch, hands‑free: a dictated `/voice` comes out of speech‑to‑text as "slash voice", so these two phrases are recognised as well. Matched as the **whole** message, so "zapni hlas až dojedu" goes to the agent like any other sentence. |
 | `/id` | show your user / chat id (handy for the allow‑list) |
 
 Anything that isn't one of these (including other `/commands`) is passed through to the agent.
