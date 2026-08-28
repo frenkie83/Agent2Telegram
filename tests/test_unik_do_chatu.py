@@ -21,6 +21,28 @@ to Telegram" than "did my message get an answer".
 Same harness as tests/test_regrese_mostu.py: a real `AttachBridge` (`_regrese_bridge()`), a real
 `ClaudeCodeReader`, fixture records shaped like a real transcript, and assertions on what actually
 leaves the bridge (`bridge.tg.sent`) or on the bridge's own turn-origin/boundary state.
+
+52103fd ("attach: silence is not the end of a turn — only an authoritative end lowers the
+origin") narrowed WHEN `_finish_turn()` is allowed to lower the flag/boundary from A — see
+tests/test_definitive_konec_tahu.py for that half.
+
+⚠️ What is NOT measured here, in either file: the invariant below ("a Telegram turn's origin
+dies with the turn") is enforced by exactly ONE place, `_finish_turn()`. Review found (and this
+suite does not cover) at least three OTHER places that end a turn, or raise the origin, without
+going through it — known, pre-existing gaps, not part of the 14f204a/52103fd fix and not
+something to read this file as having closed:
+
+  * `_resume_position()` (bridge restart) can set `_turn_from_tg = True` while `_turn_active`
+    stays whatever a freshly constructed `threading.Event()` starts as (unset) — the origin can
+    be raised with no active turn at all.
+  * `_drain_signal()` calls `_turn_active.clear()` directly on delivering a signal-file answer,
+    entirely outside `_finish_turn()` — it never touches `_turn_from_tg`/`_tg_since`.
+  * `_inject()`, on a failed write to tmux, calls `_turn_active.clear()` in its error paths —
+    again without lowering `_turn_from_tg`, which `_begin_turn()` had already raised moments
+    earlier in the same `_handle()` call.
+
+None of the three is exercised by any test in this file. Whoever picks one up should write it a
+fixture the same way these are built, not assume it behaves like `_finish_turn()`.
 """
 import json
 import tempfile
@@ -51,12 +73,16 @@ def _append_transcript(path: Path, records: list) -> None:
 # Vada A — a Telegram turn's origin must not survive the turn's own end
 # ========================================================================================
 class TelegramOriginDoesNotSurviveTurnEndTests(unittest.TestCase):
-    """`_turn_from_tg` must be False again the instant a Telegram turn ends (`_finish_turn()`).
-    Without that reset, a purely local turn that follows — typed straight into the tmux pane,
-    QUEUED by Claude Code while it is still busy, and therefore filed in the transcript only as
-    `type: "attachment"` / `attachment.type == "queued_command"`, never as `type: "user"` — has NO
-    record at all that could lower the flag (queue/attachment records produce no reader event;
-    see tests/test_regrese_mostu.py's
+    """`_turn_from_tg` must be False again the instant an AUTHORITATIVE Telegram turn end runs
+    `_finish_turn()` (the only place this invariant is enforced — see the caveat in this file's
+    module docstring for the three known doors that end a turn, or raise the origin, WITHOUT
+    going through it, which this class does not cover).
+
+    Without the reset `_finish_turn()` does perform, a purely local turn that follows — typed
+    straight into the tmux pane, QUEUED by Claude Code while it is still busy, and therefore
+    filed in the transcript only as `type: "attachment"` / `attachment.type == "queued_command"`,
+    never as `type: "user"` — has NO record at all that could lower the flag (queue/attachment
+    records produce no reader event; see tests/test_regrese_mostu.py's
     ``test_queue_bookkeeping_and_housekeeping_records_carry_no_reader_event``). Its whole output
     would then be forwarded to Telegram as if it had been asked for."""
 
