@@ -307,6 +307,7 @@ class AttachBridge:
         self._tpos = 0
         self._turn_active = threading.Event()
         self._turn_from_tg = False           # is the current transcript turn Telegram-originated?
+        self._tg_since = 0                   # byte offset where Telegram joined the current turn
         self._last_activity = 0.0            # monotonic ts of last transcript activity (for typing)
         self._status = {"mid": None, "shown": ""}   # live one-line tool-call status bubble
         self._last_typing = 0.0                      # monotonic ts of last "typing…" chat action
@@ -466,6 +467,7 @@ class AttachBridge:
         log.info("transcript → %s", newest.name)
         self._transcript = newest
         self._tpos = 0
+        self._tg_since = 0             # offsets do not carry across to a different file
         self._resume_position()
 
     # ---- lifecycle ---------------------------------------------------------
@@ -1186,11 +1188,19 @@ class AttachBridge:
         # Bridge-level slash commands (e.g. /start, /help) are answered here instead of being
         # forwarded to the agent — so the first contact is a friendly intro, not the agent
         # puzzling over "/start". Only plain-text commands, never media captions.
+        # `text` is present ONLY on a message that is nothing but text; anything with media
+        # carries `caption` instead. Both bridge-level branches below key off it, so a caption
+        # can never be read as an instruction to the bridge — for photos and documents, and
+        # equally for video, animations or any media type added later.
         text0 = (msg.get("text") or "").strip()
         if text0.startswith("/") and not (msg.get("voice") or msg.get("audio")
                                            or msg.get("photo") or msg.get("document")):
             if self._handle_command(text0, chat_id, msg.get("message_id")):
                 return True
+        # A spoken switch typed rather than dictated. Same boundary as the slash command above:
+        # it is an instruction to the bridge, so it must not reach the agent.
+        if text0 and self._handle_spoken_switch(text0, chat_id):
+            return True
 
         text = (msg.get("text") or msg.get("caption") or "").strip()
         if msg.get("voice") or msg.get("audio"):
@@ -1214,10 +1224,6 @@ class AttachBridge:
             if not note:
                 return True
             text = f"{text}\n{note}".strip()
-        elif self._handle_spoken_switch(text, chat_id):
-            # Plain text only — a caption on a photo is a note about the file, not a command
-            # to the bridge, the same boundary the slash-command branch above draws.
-            return True
         if text:
             text = self._prepend_reply_context(msg, text)
             if self._voice_reply_on():
@@ -1282,10 +1288,25 @@ class AttachBridge:
         except Exception as e:
             log.warning("could not send the receipt ACK: %s", e)
 
+    def _transcript_size(self) -> int:
+        """Bytes written to the tailed transcript so far, or 0 when there is nothing to tail."""
+        try:
+            return self._transcript.stat().st_size if self._transcript else 0
+        except OSError:
+            return 0
+
     def _begin_turn(self) -> None:
         # Light "typing…" from the actual injection point.
         self._consume_turn_end()                 # drop any stale end-marker from a prior turn
         now = time.monotonic()
+        # Where in the transcript this Telegram message joined. The turn-end backstop must not
+        # read before it: a message injected at the tail end of a LOCAL turn would otherwise get
+        # that turn's last sentence handed back as its "answer" — terminal content delivered to
+        # the chat as if the agent had written it for the user.
+        # The boundary is NOT moved when a Telegram turn is already running: a second message
+        # joining it must not hide an answer to the first one that has not been forwarded yet.
+        if not (self._turn_active.is_set() and self._turn_from_tg):
+            self._tg_since = self._transcript_size()
         self._turn_active.set()
         self._turn_from_tg = True
         self._last_activity = now
@@ -1502,8 +1523,13 @@ class AttachBridge:
         broke, a spoken confirmation is silence — and then the user cannot tell whether the
         switch worked. It is also sent when the mode did not actually change, because "zapni
         hlas" said twice is a question about the state, not a mistake.
+
+        The missing-key refusal covers BOTH directions on purpose — that is what ``/voice`` did
+        before the phrases existed, and without a key voice replies are off anyway, so refusing
+        to turn off something that cannot run changes nothing for the user. Narrowing it to the
+        ON direction would have been a change to ``/voice`` that nobody asked for.
         """
-        if on and not self.cfg.elevenlabs_api_key:
+        if not self.cfg.elevenlabs_api_key:
             self.tg.send_message(chat_id,
                 "🔊 Voice replies need an ElevenLabs key first. Add one with /setkey, then /voice.")
             return True
@@ -1612,10 +1638,19 @@ class AttachBridge:
         tail scan — used purely by the turn-end backstop, doesn't touch the live _tpos cursor."""
         if not self._transcript:
             return None
+        boundary = getattr(self, "_tg_since", 0)
         try:
             size = self._transcript.stat().st_size
+            if boundary > size:
+                # Guard, not an expected path — every route that shortens or swaps the file
+                # clears the boundary. If it ever does go stale it belongs to a file we are no
+                # longer reading, and falling back to a plain tail scan would forward a local
+                # turn's text. So stay silent, but SAY so: a backstop that goes quiet without a
+                # word is the very failure this backstop exists for.
+                log.warning("turn-end backstop skipped: boundary %d past EOF %d", boundary, size)
+                return None
             with open(self._transcript, "rb") as f:
-                f.seek(max(0, size - 2_000_000))
+                f.seek(max(0, size - 2_000_000, boundary))
                 tail = f.read()
         except OSError:
             return None
@@ -1736,6 +1771,14 @@ class AttachBridge:
             # lost reply would look exactly the same in the daily traffic analysis.
             log.info("TURN END reaction turn without a reply (backstop deliberately skipped)")
         self._turn_active.clear()
+        # A turn's Telegram origin DIES WITH THE TURN. Leaving it raised was not cosmetic: a
+        # message typed into the tmux pane while a turn is finishing gets QUEUED by Claude Code
+        # and lands in the transcript only as `attachment`/`queued_command`, which the reader
+        # ignores — so no `user` record ever arrives to lower the flag, and the whole output of
+        # that purely local turn is forwarded to Telegram. Not a lost reply this time but the
+        # reverse: terminal session content leaking into the chat.
+        self._turn_from_tg = False
+        self._tg_since = 0
         self._pending_turn_end = False
         self._consume_turn_end()
         if was_active:
@@ -1880,6 +1923,7 @@ class AttachBridge:
         size = self._transcript.stat().st_size
         if size < self._tpos:          # file rotated/truncated
             self._tpos = 0
+            self._tg_since = 0         # the boundary was an offset into the old, longer file
         if size == self._tpos:
             return
         with open(self._transcript, "rb") as f:
@@ -2020,8 +2064,9 @@ class AttachBridge:
             # Telegram-originated. The reader now filters tool results out, but anything else the
             # transcript files as a "user" record would otherwise silently reclassify a live turn
             # as local — and then the answer is never forwarded, the backstop never runs, and
-            # nothing at all appears in the log. That happened on 2026-08-23. A new turn resets
-            # the flag in _begin_turn; that is the only place it may go back to False.
+            # nothing at all appears in the log. That happened on 2026-08-23. Inside a running
+            # turn the flag therefore only ever goes UP; it is cleared at the turn's END
+            # (_finish_turn) and set again by the next _begin_turn.
             if ev.text.lstrip().startswith(self._origins):
                 self._turn_from_tg = True
             elif not self._turn_active.is_set():
