@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -126,6 +127,43 @@ VOICE_MODE_HINT = (
 # The point of voice mode is that the user need not read; a long voice note defeats that just
 # like a long text does. The agent should write SHORTER, not write all the way up to here.
 VOICE_MAX_CHARS = 1200
+
+#: Spoken switches for voice replies, matched on the WHOLE message. ``/voice`` is unreachable
+#: hands-free: dictated, speech-to-text writes "slash voice" or "lomítko vojs", never the command.
+#: The phrases are Czech because that is the language the owner dictates in; the bridge's own
+#: replies stay English, like every other notice it writes itself.
+VOICE_ON_PHRASES = frozenset({"zapni hlas"})
+VOICE_OFF_PHRASES = frozenset({"vypni hlas"})
+
+
+def _normalize_spoken(text: str) -> str:
+    """Fold a message to the form the phrase tables are written in.
+
+    Speech-to-text capitalises the first word and ends the sentence with a full stop or an
+    exclamation mark, and a typed message can carry doubled spaces — none of that changes what
+    was said. Combining marks are dropped as well, so a mis-accented rendering still matches
+    (the phrases themselves are ASCII, so nothing is lost by folding).
+    """
+    folded = unicodedata.normalize("NFKD", text or "")
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return " ".join(folded.split()).lower().strip(" .,;:!?\u2026\"'\u201e\u201c\u201d\u201a\u2018\u2019")
+
+
+def _spoken_voice_switch(text: str):
+    """``True`` = turn voice replies on, ``False`` = off, ``None`` = not a switch.
+
+    ⛔ Deliberately an EXACT match on the whole normalized message, never a substring: "zapni
+    hlas az dojedu" is a sentence about the future, and a bridge that silently flips modes in the
+    middle of one is impossible for the user to explain to themselves.
+    """
+    phrase = _normalize_spoken(text)
+    if not phrase:
+        return None
+    if phrase in VOICE_ON_PHRASES:
+        return True
+    if phrase in VOICE_OFF_PHRASES:
+        return False
+    return None
 
 
 import re as _re  # noqa: E402
@@ -1161,6 +1199,10 @@ class AttachBridge:
             text = self._transcribe(msg.get("voice") or msg.get("audio"), chat_id) or text
             if not text:
                 return True
+            # The spoken switch is checked on the BARE transcript, before the marker below is
+            # prepended — otherwise the message would never equal the phrase again.
+            if self._handle_spoken_switch(text, chat_id):
+                return True
             # The agent MUST know it is reading a machine transcript, not written text. Without
             # this it treats the transcript as verbatim and, on an error, sees nonsense instead
             # of a mis-recognition: a voice note once transcribed into the wrong language entirely
@@ -1172,6 +1214,10 @@ class AttachBridge:
             if not note:
                 return True
             text = f"{text}\n{note}".strip()
+        elif self._handle_spoken_switch(text, chat_id):
+            # Plain text only — a caption on a photo is a note about the file, not a command
+            # to the bridge, the same boundary the slash-command branch above draws.
+            return True
         if text:
             text = self._prepend_reply_context(msg, text)
             if self._voice_reply_on():
@@ -1359,7 +1405,9 @@ class AttachBridge:
                 "progress, what tools it runs, and the reply. You can also send *photos* and "
                 "*files*, and react with ❤️ as quick feedback.\n\n"
                 f"🎤 Voice transcription: {voice}.\n\n"
-                "Commands: /help · /status · /id · /setkey · /voice")
+                "Commands: /help · /status · /id · /setkey · /voice\n"
+                "Hands-free: say or type *zapni hlas* / *vypni hlas* to switch spoken replies "
+                "on and off — a dictated slash command never survives transcription.")
             return True
         if cmd == "id":
             self.tg.send_message(chat_id, f"Your Telegram id: `{chat_id}`")
@@ -1370,7 +1418,7 @@ class AttachBridge:
             self.tg.send_message(chat_id,
                 f"✅ Connected — *{agent}* in tmux session `{self.cfg.tmux_session}`.\n"
                 f"🎤 Voice transcription (ElevenLabs): {voice}\n"
-                f"🗣️ Voice replies (/voice): {replies}")
+                f"🗣️ Voice replies (/voice, or \"zapni hlas\" / \"vypni hlas\"): {replies}")
             return True
         if cmd == "setkey":
             return self._set_voice_key(arg, chat_id, message_id)
@@ -1442,18 +1490,44 @@ class AttachBridge:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def _toggle_voice(self, chat_id: int) -> bool:
-        if not self.cfg.elevenlabs_api_key:
+        return self._set_voice_mode(not bool(getattr(self, "_voice_on", False)), chat_id)
+
+    def _set_voice_mode(self, on: bool, chat_id: int) -> bool:
+        """Put voice replies into a DEFINITE state and say which one. Returns True (handled).
+
+        Shared by ``/voice`` and the spoken switches, so the two can never drift apart on what
+        the switch does or on what the user is told.
+
+        The confirmation always goes as TEXT, never as a voice note: if synthesis is what just
+        broke, a spoken confirmation is silence — and then the user cannot tell whether the
+        switch worked. It is also sent when the mode did not actually change, because "zapni
+        hlas" said twice is a question about the state, not a mistake.
+        """
+        if on and not self.cfg.elevenlabs_api_key:
             self.tg.send_message(chat_id,
                 "🔊 Voice replies need an ElevenLabs key first. Add one with /setkey, then /voice.")
             return True
-        new_state = not bool(getattr(self, "_voice_on", False))
-        self._set_voice_state(new_state)
+        self._set_voice_state(on)
         self.tg.send_message(chat_id,
             "🔊 Voice replies ON — I'll answer with voice notes. Long or table-heavy replies still "
-            "come as text. /voice again to turn off."
-            if new_state else
-            "🔇 Voice replies OFF — back to text.")
+            "come as text. Say or type \"vypni hlas\" (or /voice) to turn off."
+            if on else
+            "🔇 Voice replies OFF — back to text. Say or type \"zapni hlas\" (or /voice) "
+            "to turn them back on.")
         return True
+
+    def _handle_spoken_switch(self, text: str, chat_id: int) -> bool:
+        """Flip voice replies when the WHOLE message is a spoken switch. True = handled here.
+
+        Handled BEFORE the message reaches the agent, exactly like a slash command: "zapni hlas"
+        is an instruction to the bridge, and forwarding it would have the agent puzzle over a
+        switch it cannot operate.
+        """
+        want = _spoken_voice_switch(text)
+        if want is None:
+            return False
+        log.info("spoken voice switch %r → %s", text[:40], "on" if want else "off")
+        return self._set_voice_mode(want, chat_id)
 
     def _set_voice_key(self, key: str, chat_id: int, message_id: int | None) -> bool:
         """Save an ElevenLabs key to enable voice, then delete the message so the secret isn't
