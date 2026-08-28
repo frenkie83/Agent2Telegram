@@ -317,8 +317,16 @@ class PersistenceTests(unittest.TestCase):
 
 
 class ElevenLabsKeyGateTests(unittest.TestCase):
-    """Requirement: turning ON without a key must fail loudly and tell the user why; turning OFF
-    must always be allowed — refusing to disable something that cannot even run makes no sense."""
+    """Requirement: the missing-key refusal covers BOTH directions, not just turning ON.
+
+    This used to be asymmetric on this fork: turning OFF without a key was allowed, on the
+    reasoning that refusing to disable something that cannot even run makes no sense. Review
+    found that this was an UNREQUESTED change to `/voice`'s existing behaviour — the task never
+    asked for it — so it was reverted (see `_set_voice_mode`'s own docstring in attach.py) back
+    to upstream: without a key, voice replies are off either way, so there is nothing to persist
+    or confirm as a real state change in EITHER direction, and narrowing the refusal to just ON
+    would itself have been a silent behaviour change nobody asked for. Symmetry, not asymmetry,
+    is the deliberate contract now."""
 
     def test_turning_on_without_a_key_is_refused_and_explained(self):
         with tempfile.TemporaryDirectory() as td:
@@ -329,12 +337,16 @@ class ElevenLabsKeyGateTests(unittest.TestCase):
                             "must tell the user a key is needed")
             self.assertEqual(b._session.injected, [], "still a bridge instruction, not agent text")
 
-    def test_turning_off_without_a_key_still_works(self):
+    def test_turning_off_without_a_key_is_refused_and_explained_too(self):
         with tempfile.TemporaryDirectory() as td:
             b = _voice_bridge(td, key="", on=True)
             b._handle(_msg(1, "vypni hlas"))
-            self.assertFalse(b._voice_reply_on())
-            self.assertEqual((Path(td) / "voice_mode").read_text().strip(), "off")
+            self.assertFalse(b._voice_reply_on(), "no key means voice replies are off regardless")
+            self.assertTrue(any("key" in s.lower() for s in b.tg.sent),
+                            "must tell the user a key is needed, same as the ON direction")
+            self.assertEqual(b._session.injected, [], "still a bridge instruction, not agent text")
+            self.assertFalse((Path(td) / "voice_mode").exists(),
+                             "a refused switch must not persist a state change")
 
 
 class SlashVoiceRegressionTests(unittest.TestCase):

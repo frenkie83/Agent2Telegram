@@ -214,7 +214,19 @@ class QueuedMidTurnMessageGetsAnAnswerTests(unittest.TestCase):
     A bridge that infers Telegram origin only from `type: "user"` records would never see that
     origin and the reply would be silently dropped. Upstream fixes this a different way:
     `AttachBridge._handle()` calls `_begin_turn()` (which sets `_turn_from_tg = True`) the instant
-    the message is injected — before anything about it exists in the transcript at all."""
+    the message is injected — before anything about it exists in the transcript at all.
+
+    The real incident's turn had NOT started from Telegram: František typed straight into the
+    tmux pane (or a previous turn was still finishing) when the Telegram message landed in the
+    middle of it. That distinction matters for the test, not just the narrative: if the FIRST
+    message of the turn also came from Telegram, `_turn_from_tg` is already True before the
+    second `_handle()` call ever runs, and asserting it is still True afterwards proves nothing —
+    it would stay True even under a bridge that only stamps the origin on a turn's first message
+    and never on one joining an already-running turn. The turn here is therefore started as a
+    turn that is NOT Telegram-originated (`_turn_active` set, `_turn_from_tg` left False) before
+    the Telegram message ever arrives — the bridge has no other way to observe a purely local
+    turn starting, since only `_begin_turn()`/`_inject()` ever set `_turn_active`, and both run
+    only from `_handle()`."""
 
     def test_second_message_delivered_mid_turn_still_gets_answered(self):
         with tempfile.TemporaryDirectory() as td:
@@ -222,47 +234,67 @@ class QueuedMidTurnMessageGetsAnAnswerTests(unittest.TestCase):
             transcript = Path(td) / "transcript.jsonl"
             b._transcript = transcript
 
-            # First message starts the turn normally.
-            b._handle(_msg(1, "[TG] first question"))
-            self.assertTrue(b._turn_active.is_set())
-            self.assertTrue(b._turn_from_tg)
+            # A turn is already running, but it did NOT start from Telegram — the state a
+            # locally started turn (typed into tmux, or still finishing earlier local work)
+            # leaves the bridge in.
+            b._turn_active.set()
+            b._turn_from_tg = False
 
-            # A second message lands while Claude Code is still working on the first — the
-            # message gets QUEUED by Claude Code, not injected as a fresh prompt. The bridge
-            # still runs its normal inbound path for it (this is the fix: origin is stamped
-            # at injection time, not derived later from the transcript).
-            b._handle(_msg(2, "[TG] second question, are you still there"))
+            # A Telegram message now lands in the middle of that running, non-Telegram turn.
+            # Claude Code QUEUES it — it will show up in the transcript only as
+            # `type: "attachment"` / `attachment.type == "queued_command"`, never as
+            # `type: "user"`. The bridge still runs its normal inbound path for it (this is the
+            # fix: origin is stamped at injection time, not derived later from the transcript).
+            b._handle(_msg(1, "[TG] are you still there"))
             self.assertTrue(
                 b._turn_from_tg,
-                "origin must be stamped at injection time — if it depended on the transcript, "
-                "a queued message (never filed as type:\"user\") would leave the flag False and "
-                "its reply would never reach the user",
+                "a Telegram message joining an ALREADY-RUNNING turn that did NOT start from "
+                "Telegram must still mark it Telegram-originated from here on — origin is "
+                "stamped at injection time in _begin_turn(), not derived later from the "
+                "transcript, precisely because the queued message never gets its own "
+                "type:\"user\" record to derive it from",
             )
 
-            # What Claude Code actually writes to disk once it catches up: the first prompt as a
-            # real "user" record, the queue bookkeeping, a housekeeping total_tokens_reminder
-            # attachment, and the second prompt ONLY as a queued_command attachment — never as
-            # "user" — followed by the assistant's combined answer.
+            # What Claude Code actually writes to disk once it catches up: the queue
+            # bookkeeping, a housekeeping total_tokens_reminder attachment, the queued prompt
+            # ONLY as an attachment — never as "user" — followed by the assistant's answer.
             _write_transcript(transcript, [
-                _user_record("[TG] first question"),
                 _QUEUE_ENQUEUE,
                 _TOTAL_TOKENS_REMINDER,
                 _QUEUE_REMOVE,
-                _attachment_record("[TG] second question, are you still there"),
-                _assistant_record("[tg] both handled — yes, still here"),
+                _attachment_record("[TG] are you still there"),
+                _assistant_record("[tg] yes, still here"),
             ])
 
             b._drain_transcript()
 
             self.assertIn(
-                "both handled — yes, still here", "\n".join(b.tg.sent),
+                "yes, still here", "\n".join(b.tg.sent),
                 "the reply for the mid-turn-queued message never reached Telegram — Claude Code "
                 "shows the turn as answered, but the user saw nothing",
             )
-            self.assertTrue(
-                b._turn_from_tg,
-                "queue bookkeeping (queue-operation) and housekeeping attachments "
-                "(total_tokens_reminder) must never flip a live Telegram turn back to local",
+            # NOT re-asserting `b._turn_from_tg` here on purpose: `ClaudeCodeReader.parse()`
+            # yields NOTHING at all for queue-operation and attachment records (see
+            # `test_queue_bookkeeping_and_housekeeping_records_carry_no_reader_event` below), so
+            # draining them can never touch `_turn_from_tg` either way — an assert repeating the
+            # one above would look like it measured that, and would never be able to fail.
+
+    def test_queue_bookkeeping_and_housekeeping_records_carry_no_reader_event(self):
+        """Why the assert above doesn't need to (and can't usefully) re-check `_turn_from_tg`
+        after draining queue/housekeeping records: `ClaudeCodeReader.parse()` produces NO event
+        at all for `type: "queue-operation"` or `type: "attachment"` records — its `parse()`
+        only recognises `type: "user"` and `type: "assistant"`. This is not incidental, it is the
+        actual reason the fix stamps Telegram origin at injection time (`_begin_turn()`) instead
+        of deriving it from the transcript: for a queued message there is structurally nothing in
+        the transcript for a reader to derive it FROM."""
+        reader = readers.for_agent("claude-code")
+        for rec in (_QUEUE_ENQUEUE, _QUEUE_REMOVE, _TOTAL_TOKENS_REMINDER,
+                    _attachment_record("[TG] are you still there")):
+            self.assertEqual(
+                list(reader.parse(rec)), [],
+                f"expected no reader event for record type {rec.get('type')!r} — if this ever "
+                "yields something, _handle_event() may act on it and the turn-origin reasoning "
+                "above (and in _begin_turn()) needs to be re-examined",
             )
 
     def test_backstop_still_delivers_if_no_interim_text_was_forwarded(self):
