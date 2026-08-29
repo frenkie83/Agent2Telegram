@@ -648,12 +648,17 @@ class AttachBridge:
         # code path: when the user says "I wrote and nothing happened", a bridge that drops
         # the update here leaves no trace whatsoever — the journal shows the poll loop
         # running and not one line about the message. An hour went into that on 2026-08-28.
-        # DEBUG, not INFO: on a healthy bridge these fire on every restart with a backlog.
+        #
+        # ⛔ INFO, not DEBUG. DEBUG only exists when the bridge is started with -v, and the
+        # systemd unit that runs it in production does not pass -v — a DEBUG line would have
+        # left exactly the same nothing behind. Volume is not a concern either: Telegram does
+        # not return updates below an acknowledged offset, so the first branch is close to
+        # dead, and the ledger only matches on a genuine re-delivery.
         if update_id is not None and update_id < offset:
-            log.debug("update %s skipped: below the stored offset %s", update_id, offset)
+            log.info("update %s skipped: below the stored offset %s", update_id, offset)
             return offset
         if self._update_was_processed(update_id):
-            log.debug("update %s skipped: already in the processed ledger", update_id)
+            log.info("update %s skipped: already in the processed ledger", update_id)
             self._save_offset(next_offset)
             return next_offset
 
@@ -1228,10 +1233,14 @@ class AttachBridge:
         wrong about the same message. A video note or a sticker therefore vanished without
         leaving a single trace anywhere, which is indistinguishable from the bridge being down.
         """
-        kinds = [k for k in self.UNREADABLE_KINDS if msg.get(k)] or ["no text and no caption"]
-        popis = ", ".join(kinds)
+        kinds = [k for k in self.UNREADABLE_KINDS if msg.get(k)]
+        popis = ", ".join(kinds) if kinds else "no text and no caption"
         log.info("nothing to forward from message #%s (%s)", msg.get("message_id"), popis)
-        if chat_id is not None:
+        # ⛔ The user is told only when they actually SENT something the bridge cannot read.
+        # Without that condition every service message in a group chat (someone joined, a
+        # message got pinned) would earn its own "I can't read this" — the bridge would
+        # heckle the room. Those still get the log line above; they just don't get an answer.
+        if chat_id is not None and kinds:
             try:
                 self.tg.send_message(
                     chat_id,

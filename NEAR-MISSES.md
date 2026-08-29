@@ -393,7 +393,20 @@ went into diagnosing a defect that was not there.
 
 **What catches it next time:** in this bridge, no code path may drop an inbound message
 without leaving a line in the log — the two silent `return`s in `_handle_update_once` and
-the "handled but not delivered" cases of `_handle` now name themselves, and `_send_keys`
-verifies the Enter actually submitted instead of trusting the exit code of `send-keys`.
+the "handled but not delivered" cases of `_handle` now name themselves, at INFO, because
+the deployed unit does not pass `-v` and a DEBUG line would leave the same nothing behind.
+The watchdog itself was corrected to read its input line from the cursor position
+(`#{cursor_y}`) instead of pattern-matching the bottom of the pane; it lives in the
+operator's own repository, not here.
+
 The checklist question for any monitoring output used as evidence: *what does this tool
 observe, and what else looks the same to it?*
+
+⚠️ **And a coda, because it is the same mistake one level down.** The first attempt at this
+entry's fix had `_send_keys` verify that the Enter really submitted, by checking that the
+tail of the injected text was gone from the cursor row. Review measured it on an 80-column
+pane: an unsent message of 85–100 characters reported as *submitted*, because the tail fell
+across the wrap and simply was not on that row. It would have deleted the durable record of
+the very messages it was meant to protect, and its failure path re-typed the message up to
+fifteen times. **It was removed, not patched.** A safeguard against a failure nobody has
+reproduced, whose own failure modes are not measured either, is not a safeguard.

@@ -36,20 +36,6 @@ _STATUS_RE = re.compile(r"^[✻✶✳✢✺✷*]\s")           # spinner/status,
 _BULLET_RE = re.compile(r"^\s*[⏺●○•]\s?")           # assistant output bullet
 
 MAX_TMUX_INJECTION_CHARS = 8000
-
-#: How long to wait for the TUI to acknowledge the Enter before calling the injection stuck,
-#: and how often to look. `tmux send-keys` exits 0 as soon as tmux has written the keys into
-#: the pane — it says nothing about whether the program on the other end acted on them, so
-#: without this check "the message was delivered" is a claim, not a measurement.
-#: ⚠️ The wait is generous on purpose: a long prompt wraps over several rows and the TUI
-#: redraw was measured still lagging half a second behind. Declaring failure early would be
-#: worse than not checking at all.
-SUBMIT_CONFIRM_S = 2.5
-SUBMIT_POLL_S = 0.15
-#: How much of the injected text has to be gone from the prompt for it to count as submitted.
-#: The tail, not the head: a wrapped prompt puts the cursor on the LAST row, so that is the
-#: part that is visible there.
-SUBMIT_TAIL_CHARS = 24
 _SHELL_COMMANDS = {
     "ash", "bash", "csh", "dash", "fish", "ksh", "mksh", "pwsh", "sh", "tcsh", "zsh",
 }
@@ -298,73 +284,9 @@ class TmuxSession:
         _tmux("send-keys", "-t", self.name, "C-u"); time.sleep(0.05)
         _tmux("send-keys", "-t", self.name, "-l", "--", text); time.sleep(0.15)
         _tmux("send-keys", "-t", self.name, "Enter")
-        self._confirm_submitted(text)
-
-    def _confirm_submitted(self, text: str) -> None:
-        """Make sure the Enter actually submitted, and shout when it did not.
-
-        ⛔ Why this exists. `tmux send-keys` returning 0 only means tmux delivered the
-        keystroke; the message can still be left sitting in the prompt, unsent. That failure
-        is completely silent — the bridge logs the message as delivered, the user waits for an
-        answer that will never come, and the only trace is text visible in a tmux window
-        nobody is looking at. It cost an hour of diagnosis on 2026-08-28.
-
-        ⚠️ Deliberately NOT a fix for whatever swallows the Enter: the cause is not measured
-        (12 of 12 and then 12 of 12 injections landed on this machine, with and without a 3x
-        CPU overload, on Claude Code 2.1.235). This turns a silent failure into a loud one.
-        One extra Enter is tried first because it is free and cannot duplicate anything — an
-        Enter on an empty prompt is a no-op, and if the text is still there it was never sent.
-        """
-        stav = self._submitted(text)
-        if stav is not False:
-            return                          # submitted, or not measurable — either way, no claim
-        log.warning("the prompt still holds the message after Enter in '%s' — trying once more",
-                    self.name)
-        _tmux("send-keys", "-t", self.name, "Enter", check=False)
-        if self._submitted(text) is False:
-            raise SessionError(
-                f"the message stayed in the prompt of tmux session '{self.name}' — "
-                "Enter did not submit it")
-        log.info("the second Enter submitted it in '%s'", self.name)
 
     def _capture(self) -> str:
         return _tmux("capture-pane", "-p", "-t", self.name, check=False).stdout
-
-    def _prompt_row(self) -> str | None:
-        """The row the cursor is on — the prompt line, whatever the TUI draws around it.
-
-        The cursor is the one place in the pane that cannot be confused with the transcript:
-        the agent writes its answers upwards, the cursor stays in the prompt. An echo of an
-        already-submitted message therefore never sits under it. Returns None when tmux won't
-        say (then the caller must not conclude anything).
-        """
-        r = _tmux("display-message", "-p", "-t", self.name, "#{cursor_y}", check=False)
-        y = (r.stdout or "").strip()
-        if not y.isdigit():
-            return None
-        r = _tmux("capture-pane", "-p", "-t", self.name, "-S", y, "-E", y, check=False)
-        if r.returncode != 0:
-            return None
-        return r.stdout.rstrip("\n")
-
-    def _submitted(self, text: str) -> bool | None:
-        """Did the Enter take? True/False, or None when it cannot be measured.
-
-        Measured, not assumed: while text sits unsent in the prompt, its tail is on the cursor
-        row; once it is submitted (or queued by the TUI for after the current turn), the prompt
-        clears and the tail is gone from there.
-        """
-        tail = text[-SUBMIT_TAIL_CHARS:]
-        deadline = time.monotonic() + SUBMIT_CONFIRM_S
-        seen = None
-        while True:
-            row = self._prompt_row()
-            if row is None:
-                return None                 # tmux won't say — don't guess either way
-            seen = tail not in row
-            if seen or time.monotonic() >= deadline:
-                return seen
-            time.sleep(SUBMIT_POLL_S)
 
     def inject(self, text: str) -> None:
         """Fire-and-forget: type the message into the session, don't wait for a reply.
