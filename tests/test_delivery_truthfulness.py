@@ -14,6 +14,19 @@ This file checks three things, matching the commit's own numbering:
       only logs "delivered to session" for a real `True`.
   C — `_nothing_to_forward` (sticker, video note, poll...) names the payload, logs it, and
       tells the user — and a broken `send_message` must not blow up the caller.
+
+Plus three gaps review found in 820a350 (the follow-up that dropped the unsound `_send_keys`
+check and fixed the two things listed below its message):
+
+  D — the two silent-skip branches inside `_handle_update_once` (an update below the stored
+      offset, an update already in the processed ledger) now log at INFO, not DEBUG — DEBUG
+      only exists with `-v`, which the production systemd unit never passes.
+  E — `_nothing_to_forward` no longer tells the user about a payload that is not a payload —
+      a group service message (a join, a pin) has neither text nor any `UNREADABLE_KINDS`
+      field. It still gets the log line, just not the chat reply. A genuinely unreadable
+      payload (a sticker) must still get one, side by side with the silent case.
+  F — `_nothing_to_forward` must not crash and must not call `send_message` when there is no
+      `chat_id` to send to.
 """
 import logging
 import tempfile
@@ -271,6 +284,104 @@ class NothingToForwardTests(unittest.TestCase):
         b = _bridge(client=_BrokenClient())
         b._nothing_to_forward({"message_id": 48, "sticker": {"file_id": "s1"}}, 7)
         self.assertIn("sticker", self.caplog.text)
+
+
+# --------------------------------------------------------------------------------------
+# D — the two silent skips in `_handle_update_once` log at INFO, not DEBUG
+# --------------------------------------------------------------------------------------
+class UpdateSkipsAreLoggedAtInfoTests(unittest.TestCase):
+    """Both branches used to be `log.debug`. DEBUG only exists when the bridge runs with
+    `-v`; the production systemd unit does not pass it, so a DEBUG line leaves exactly the
+    same nothing behind as the silent skip it was meant to replace. `caplog.set_level` is
+    pinned to INFO here on purpose: a regression back to `log.debug` must make these fail,
+    not just log something the test isn't looking hard enough for."""
+
+    @pytest.fixture(autouse=True)
+    def _inject_caplog(self, caplog):
+        self.caplog = caplog
+
+    def test_update_below_stored_offset_is_logged_at_info_and_the_offset_does_not_move(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.caplog.set_level(logging.INFO, logger=LOGGER_NAME)
+            b = _bridge(state_dir=td)
+
+            result = b._handle_update_once(_msg(update_id=5, text="late"), 10)
+
+            self.assertEqual(result, 10, "an update older than the stored offset must not move it")
+            self.assertIn("update 5 skipped: below the stored offset 10", self.caplog.text)
+            self.assertEqual(b._session.injected, [])
+
+    def test_already_processed_update_is_logged_at_info_and_never_reaches_the_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.caplog.set_level(logging.INFO, logger=LOGGER_NAME)
+            b = _bridge(state_dir=td)
+            b._mark_update_processed(3)
+
+            result = b._handle_update_once(_msg(update_id=3, text="again"), 0)
+
+            self.assertEqual(result, 4, "the offset still advances past a duplicate")
+            self.assertIn("update 3 skipped: already in the processed ledger", self.caplog.text)
+            self.assertEqual(b._session.injected, [],
+                              "a duplicate already in the ledger must never reach the session")
+            self.assertFalse(hasattr(b, "_inbound_queue"),
+                              "the duplicate must return before anything is ever submitted to the worker")
+
+
+# --------------------------------------------------------------------------------------
+# E — `_nothing_to_forward` stops heckling service messages, keeps warning about real ones
+# --------------------------------------------------------------------------------------
+class NothingToForwardOnlyNotifiesRealPayloadsTests(unittest.TestCase):
+    @pytest.fixture(autouse=True)
+    def _inject_caplog(self, caplog):
+        self.caplog = caplog
+
+    def test_service_message_stays_silent_while_a_sticker_still_gets_a_reply(self):
+        """Both go through the same bridge in the same test so the split is visible: a
+        service message (no text, no caption, no UNREADABLE_KINDS field — a join, a pin)
+        must not earn a chat reply, but a message the user actually sent that the bridge
+        cannot read (a sticker) still must."""
+        self.caplog.set_level(logging.INFO, logger=LOGGER_NAME)
+        b = _bridge()
+
+        service_reason = b._nothing_to_forward(
+            {"message_id": 50, "new_chat_members": [{"id": 1}]}, 7)
+        self.assertIsInstance(service_reason, str)
+        self.assertEqual(b.tg.sent, [], "a service message must not earn a chat reply")
+
+        sticker_reason = b._nothing_to_forward(
+            {"message_id": 51, "sticker": {"file_id": "s1"}}, 7)
+        self.assertIsInstance(sticker_reason, str)
+        self.assertEqual(len(b.tg.sent), 1,
+                          "a genuinely unreadable payload must still get a reply")
+        self.assertEqual(b.tg.sent[0][0], 7)
+
+        self.assertIn("50", self.caplog.text, "the service message still gets the log line")
+        self.assertIn("51", self.caplog.text, "the sticker still gets the log line")
+
+    def test_pinned_message_notice_is_logged_but_not_sent_to_the_user(self):
+        self.caplog.set_level(logging.INFO, logger=LOGGER_NAME)
+        b = _bridge()
+
+        b._nothing_to_forward({"message_id": 52, "pinned_message": {"message_id": 10}}, 7)
+
+        self.assertEqual(b.tg.sent, [])
+        self.assertIn("52", self.caplog.text)
+
+
+# --------------------------------------------------------------------------------------
+# F — `_nothing_to_forward` without a chat_id must neither crash nor try to send
+# --------------------------------------------------------------------------------------
+class NothingToForwardWithoutChatIdTests(unittest.TestCase):
+    def test_missing_chat_id_does_not_crash_and_does_not_call_send_message(self):
+        b = _bridge()
+
+        try:
+            r = b._nothing_to_forward({"message_id": 60, "sticker": {"file_id": "s1"}}, None)
+        except Exception as e:
+            self.fail(f"_nothing_to_forward must not crash when chat_id is None: {e!r}")
+
+        self.assertIsInstance(r, str)
+        self.assertEqual(b.tg.sent, [], "with no chat_id there is nowhere to send the notice")
 
 
 if __name__ == "__main__":
