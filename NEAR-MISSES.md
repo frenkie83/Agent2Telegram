@@ -360,3 +360,40 @@ works.
 **The rule worth keeping:** when an agent can do a thing two ways and only one of them is wired
 up, that is not a documentation problem — the unwired path will be taken, because it looks
 right. Wire it up, or make it fail loudly. Never let it be silent.
+
+---
+
+## 2026-08-29 · Two diagnoses in a row rested on a watchdog measuring something else
+
+**What happened:** an operator watchdog reported `UNSENT INSTRUCTION in the window: "zapni
+hlas", unchanged for 45 min` for a session driven by this bridge. On the strength of that
+report a working bridge deployment was rolled back, and a follow-up note explained the same
+report with an inbound FIFO queue "that failed to drain".
+
+Neither held up:
+
+* The FIFO queue was added in `06a2d59` and **reverted 47 minutes later** in `8665948` —
+  it has not existed in this tree since June. The CLI's own mid-turn queue was measured live
+  and drains within a second of the turn ending.
+* The bridge journal for that hour contains the startup line and nothing else — no accepted
+  update, and no `getUpdates` error either, although the poll loop logs both. All three
+  bridges on the machine were equally silent. The message never reached the bot.
+* The watchdog matched `^❯ <text>$` anywhere in the bottom rows of the pane — which is also
+  the shape of the **echo of an already-answered message** in the transcript. Reproduced A/B
+  on the same live pane in the same second: old rule "UNSENT INSTRUCTION", corrected rule
+  silent. On the day itself it fired for three different sessions at the same minute, each
+  with its own plausible text — three bots, three chats, one human, one second.
+
+**Why it slipped through:** the watchdog's output *reads* like a measurement. Nobody asked
+what it actually measures, and the explanation offered afterwards borrowed a commit from
+the log without checking whether it was still in the tree.
+
+**Damage:** none to the software — a working deployment was rolled back and about an hour
+went into diagnosing a defect that was not there.
+
+**What catches it next time:** in this bridge, no code path may drop an inbound message
+without leaving a line in the log — the two silent `return`s in `_handle_update_once` and
+the "handled but not delivered" cases of `_handle` now name themselves, and `_send_keys`
+verifies the Enter actually submitted instead of trusting the exit code of `send-keys`.
+The checklist question for any monitoring output used as evidence: *what does this tool
+observe, and what else looks the same to it?*
