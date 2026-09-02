@@ -2096,7 +2096,8 @@ class AttachBridge:
                 log.warning("downloaded voice/audio too large for STT: %s bytes", len(audio))
                 return None
             return stt.transcribe(audio, api_key=self.cfg.elevenlabs_api_key,
-                                  filename=Path(fp).name or "voice.ogg")
+                                  filename=Path(fp).name or "voice.ogg",
+                                  language=self.cfg.stt_language)
         except Exception as e:
             log.error("transcription failed: %s", e)
             # This is an inbound voice-note failure, not agent output for the current turn.
