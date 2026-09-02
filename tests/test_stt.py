@@ -234,3 +234,37 @@ class KeyShape(unittest.TestCase):
 
     def test_prazdny_klic_neprojde(self):
         self.assertFalse(stt.looks_like_api_key(""))
+
+
+
+class LanguagePinning(unittest.TestCase):
+    """Bez jazyka Scribe hádá a na krátké nahrávce se strefí vedle — 2026-09-02 vrátil
+    dvouvteřinovou českou zprávu jako portugalštinu. Detekce potřebuje materiál a hlasovka
+    ho často nemá."""
+
+    def _opener(self, zachyceno):
+        class Op:
+            def open(self, req, timeout=None):
+                zachyceno["body"] = req.data
+                class R:
+                    def __enter__(self): return self
+                    def __exit__(self, *a): return False
+                    def read(self): return b'{"text":"ahoj"}'
+                return R()
+        return Op()
+
+    def test_jazyk_se_posle_kdyz_je_nastaveny(self):
+        """Měří, že se kód dostane DO REQUESTU — ⛔ ne že funkce nespadne."""
+        z = {}
+        out = stt.transcribe_elevenlabs(b"audio", api_key="k", language="ces",
+                                        opener=self._opener(z))
+        self.assertEqual(out, "ahoj")
+        self.assertIn(b"language_code", z["body"])
+        self.assertIn(b"ces", z["body"])
+
+    def test_prazdny_jazyk_nechava_dosavadni_chovani(self):
+        """Prázdno musí request nechat beze změny — jinak by upgrade změnil chování všem."""
+        z = {}
+        stt.transcribe_elevenlabs(b"audio", api_key="k", language="",
+                                  opener=self._opener(z))
+        self.assertNotIn(b"language_code", z["body"])
