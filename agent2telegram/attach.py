@@ -688,9 +688,21 @@ class AttachBridge:
             log.warning("skipping malformed Telegram update without a valid update_id: %r", upd)
             return offset
         next_offset = max(offset, update_id + 1) if update_id is not None else offset
+        # Both skips below used to be SILENT. That is the worst possible shape for this
+        # code path: when the user says "I wrote and nothing happened", a bridge that drops
+        # the update here leaves no trace whatsoever — the journal shows the poll loop
+        # running and not one line about the message. An hour went into that on 2026-08-28.
+        #
+        # ⛔ INFO, not DEBUG. DEBUG only exists when the bridge is started with -v, and the
+        # systemd unit that runs it in production does not pass -v — a DEBUG line would have
+        # left exactly the same nothing behind. Volume is not a concern either: Telegram does
+        # not return updates below an acknowledged offset, so the first branch is close to
+        # dead, and the ledger only matches on a genuine re-delivery.
         if update_id is not None and update_id < offset:
+            log.info("update %s skipped: below the stored offset %s", update_id, offset)
             return offset
         if self._update_was_processed(update_id):
+            log.info("update %s skipped: already in the processed ledger", update_id)
             self._save_offset(next_offset)
             return next_offset
 
@@ -1033,11 +1045,23 @@ class AttachBridge:
             else:
                 # `_handle` returns False when the message never reached the session. Both cases
                 # used to just call task_done and the message vanished — that is audit finding B.
-                if delivered is not False:
-                    log.info("IN  delivered to session id=%s", record_id)
+                #
+                # A THIRD case exists and used to hide inside the first: `_handle` also returns
+                # a truthy value for updates it deliberately does not forward (a sticker, a
+                # bridge-level slash command, a removed reaction). The log then said
+                # "IN delivered to session" about a message the session never saw. On
+                # 2026-08-28 an hour went into deciding whether a message had been delivered —
+                # with a log that answers that question only when it happens to be true, the
+                # question cannot be answered at all. `_handle` now names the reason and the
+                # log repeats it verbatim.
                 if delivered is False:
                     self._inbound_failed(record_id, "not delivered to the session")
                 else:
+                    if delivered is True:
+                        log.info("IN  delivered to session id=%s", record_id)
+                    else:
+                        log.info("IN  id=%s NOT delivered to the session: %s",
+                                 record_id, delivered)
                     self._inbound_done(record_id)
             finally:
                 self._inbound_queue.task_done()
@@ -1121,19 +1145,29 @@ class AttachBridge:
                 except Exception as e:
                     log.exception("inbound error: %s", e)
 
-    def _handle(self, upd: dict) -> bool:
+    def _handle(self, upd: dict) -> bool | str:
         """Handle one update. Returns False ONLY when the message was not delivered to the session.
 
-        The return value drives the durable inbox: True = handled, the record may go; False = not
-        delivered, the record stays and is retried. So every "nothing to do" branch returns True —
-        retrying them is pointless. False comes solely from a failed write to tmux, exactly what
-        retrying cures.
+        The return value drives the durable inbox: truthy = handled, the record may go; False =
+        not delivered, the record stays and is retried. So every "nothing to do" branch returns
+        something truthy — retrying them is pointless. False comes solely from a failed write to
+        tmux, exactly what retrying cures.
+
+        ⭐ Truthy has two shapes and the difference is the whole point:
+
+          * ``True``  — the text really went into the session,
+          * ``"<reason>"`` — handled, but the session never saw it (a sticker, a bridge-level
+            slash command, a removed reaction, a transcription that failed).
+
+        Both used to be ``True``, so the log said "IN delivered to session" for messages that
+        were never delivered. A log that is only truthful when nothing is wrong is worth
+        nothing during an incident — see the caller in :meth:`_inbound_worker_loop`.
         """
         # Reactions (e.g. ❤️) → quick-feedback line.
         mr = upd.get("message_reaction")
         if mr:
             if mr.get("user", {}).get("id") not in self._allowed:
-                return True
+                return "reaction from a user who is not allowed"
             emojis = "".join(r.get("emoji", "") for r in mr.get("new_reaction", [])
                              if r.get("type") == "emoji")
             if emojis:
@@ -1153,7 +1187,7 @@ class AttachBridge:
                 if seen is not None and now - seen < REACTION_DEDUP_S:
                     log.info("reaction %s on #%s ignored as a duplicate (%.1fs after the first)",
                              emojis, mr.get("message_id"), now - seen)
-                    return True
+                    return "duplicate reaction"
                 self._reaction_seen[key] = now
                 if len(self._reaction_seen) > 512:      # drobná pojistka proti růstu
                     for k in sorted(self._reaction_seen, key=self._reaction_seen.get)[:256]:
@@ -1177,16 +1211,16 @@ class AttachBridge:
                     f"{emojis} reacted {emojis} to your message #{mr.get('message_id')} "
                     f"— quick feedback. Always answer, but with ONE very short line "
                     f"(a few words or an emoji), nothing more.")
-            return True
+            return "reaction carried no emoji (the user removed it)"
 
         msg = upd.get("message") or upd.get("edited_message")
         if not msg:
-            return True
+            return "update carries neither a message nor an edit"
         user_id = msg.get("from", {}).get("id")
         chat_id = msg["chat"]["id"]
         if user_id not in self._allowed:
             self.tg.send_message(chat_id, "⛔ Not authorized.")
-            return True
+            return "sender is not on the allow-list"
 
 
         # Bridge-level slash commands (e.g. /start, /help) are answered here instead of being
@@ -1200,11 +1234,16 @@ class AttachBridge:
         if text0.startswith("/") and not (msg.get("voice") or msg.get("audio")
                                            or msg.get("photo") or msg.get("document")):
             if self._handle_command(text0, chat_id, msg.get("message_id")):
-                return True
+                return f"answered by the bridge itself ({text0.split()[0]})"
         # A spoken switch typed rather than dictated. Same boundary as the slash command above:
         # it is an instruction to the bridge, so it must not reach the agent.
+        #
+        # ⛔ A reason, not True. The switch is answered HERE and the session never sees it, so
+        # under the contract above it is the second shape of truthy. Returning True would put
+        # "IN delivered to session" in the log about a message that never got there — the exact
+        # untruth this branch of the fork was written to remove.
         if text0 and self._handle_spoken_switch(text0, chat_id):
-            return True
+            return "answered by the bridge itself (spoken switch)"
 
         text = (msg.get("text") or msg.get("caption") or "").strip()
         if msg.get("voice") or msg.get("audio"):
@@ -1212,11 +1251,11 @@ class AttachBridge:
             # themselves, so we don't loop here — an external retry would just pay for STT again.
             text = self._transcribe(msg.get("voice") or msg.get("audio"), chat_id) or text
             if not text:
-                return True
+                return "voice note produced no transcript (the user was told)"
             # The spoken switch is checked on the BARE transcript, before the marker below is
             # prepended — otherwise the message would never equal the phrase again.
             if self._handle_spoken_switch(text, chat_id):
-                return True
+                return "answered by the bridge itself (spoken switch)"
             # The agent MUST know it is reading a machine transcript, not written text. Without
             # this it treats the transcript as verbatim and, on an error, sees nonsense instead
             # of a mis-recognition: a voice note once transcribed into the wrong language entirely
@@ -1226,7 +1265,7 @@ class AttachBridge:
         elif msg.get("photo") or msg.get("document"):
             note = self._download_note(msg, chat_id)
             if not note:
-                return True
+                return "attachment could not be taken over (the user was told)"
             text = f"{text}\n{note}".strip()
         if text:
             text = self._prepend_reply_context(msg, text)
@@ -1236,10 +1275,42 @@ class AttachBridge:
                 text = f"{VOICE_MODE_HINT}\n{text}"
             text = self._limit_inbound_prompt(text, chat_id)
             if not text:
-                return True
+                return "prompt was rejected by the length limit (the user was told)"
             self._begin_turn()
             return self._inject(text)
-        return True
+        return self._nothing_to_forward(msg, chat_id)
+
+    #: Message payloads Telegram can deliver that carry no text the agent could read.
+    #: The bridge understands text, captions, voice/audio and photo/document; everything
+    #: else falls through. Names are Telegram's own field names.
+    UNREADABLE_KINDS = ("sticker", "video", "video_note", "animation", "poll", "location",
+                        "venue", "contact", "dice", "game", "story")
+
+    def _nothing_to_forward(self, msg: dict, chat_id) -> str:
+        """A message the bridge cannot turn into a prompt. Say so — to the log and to the user.
+
+        ⛔ This branch used to be a bare ``return True``: the message was dropped, the user was
+        told nothing, and the worker logged "IN delivered to session". Three ways of being
+        wrong about the same message. A video note or a sticker therefore vanished without
+        leaving a single trace anywhere, which is indistinguishable from the bridge being down.
+        """
+        kinds = [k for k in self.UNREADABLE_KINDS if msg.get(k)]
+        popis = ", ".join(kinds) if kinds else "no text and no caption"
+        log.info("nothing to forward from message #%s (%s)", msg.get("message_id"), popis)
+        # ⛔ The user is told only when they actually SENT something the bridge cannot read.
+        # Without that condition every service message in a group chat (someone joined, a
+        # message got pinned) would earn its own "I can't read this" — the bridge would
+        # heckle the room. Those still get the log line above; they just don't get an answer.
+        if chat_id is not None and kinds:
+            try:
+                self.tg.send_message(
+                    chat_id,
+                    f"⚠️ I can't read this kind of message ({popis}), so I didn't pass it on. "
+                    "Text, a voice note, a photo or a file all work.")
+            except Exception as e:
+                # Not fatal: the log line above is still the record that it happened.
+                log.warning("could not tell the user the message was unreadable: %s", e)
+        return f"nothing to forward ({popis})"
 
     def _prepend_reply_context(self, msg: dict, text: str) -> str:
         """When the user replies to a specific message, tell the agent which one.
@@ -2180,7 +2251,8 @@ class AttachBridge:
                 log.warning("downloaded voice/audio too large for STT: %s bytes", len(audio))
                 return None
             return stt.transcribe(audio, api_key=self.cfg.elevenlabs_api_key,
-                                  filename=Path(fp).name or "voice.ogg")
+                                  filename=Path(fp).name or "voice.ogg",
+                                  language=self.cfg.stt_language)
         except Exception as e:
             log.error("transcription failed: %s", e)
             # This is an inbound voice-note failure, not agent output for the current turn.
