@@ -45,7 +45,15 @@ log = logging.getLogger("agent2telegram.attach")
 #: Fallback only: how long the transcript may be quiet before we force-end a turn, in case
 #: the Stop-hook turn-end marker never arrives. The marker is the primary, precise signal —
 #: this just stops "typing…" from hanging forever if the hook is missing/misconfigured.
-IDLE_DONE = 90.0
+#
+#: 2026-09-08: raised 90 -> 600. On the supervisor bridge the Stop hook never fires
+#: ("hook se neozval" on every turn), so this fallback is the ONLY turn-end signal — and at
+#: 90 s it fired in the MIDDLE of long agent turns. Measured: dur=152.1s and dur=178.3s both
+#: ended with text_sent=False, i.e. the user's answer was dropped, while max_gap was 1.7 s —
+#: the agent was working the whole time. A turn that ends after the agent is genuinely done
+#: gets its answer forwarded from the transcript (seen working at 14:20), so the only thing
+#: the short timeout bought was cutting live turns short.
+IDLE_DONE = 600.0
 # A write to tmux can fail transiently (busy pane, full buffer), so it is retried.
 # A short pause on purpose: a user's message must not wait longer than the user's patience.
 INJECT_ATTEMPTS = 3
