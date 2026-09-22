@@ -139,21 +139,125 @@ class AttachBackstopTests(unittest.TestCase):
             self.assertTrue(any("Telegram turn ended without an answer" in line for line in logs.output))
             self.assertTrue(any("typing_count=7" in line for line in logs.output))
 
-    def test_already_sent_turn_text_is_not_sent_again(self):
+    def test_last_sent_text_matching_the_transcripts_final_message_is_not_resent(self):
+        """T-0404 changed the contract this test pins. It used to assert the opposite of what is
+        checked below: that the turn-end path must not even READ the transcript once
+        `_turn_text_sent` is True. That exact assumption was the bug — it made the bridge blind to
+        a DIFFERENT final answer landing in the transcript after the interim send (measured
+        2026-09-21 22:36 and 2026-09-22 19:12:30, see LateFinalAnswerAfterInterimTextTests below).
+        Reading the transcript at turn end is fine now and expected; what must still never happen
+        is a duplicate send when the transcript's last message IS the one already forwarded."""
         with tempfile.TemporaryDirectory() as d:
             b = _bridge(d)
             b._turn_text_sent = True
+            b._turn_sent_keys = {"already-key"}      # this turn already forwarded this key
             b.tg.sent.append((7, "already sent"))
 
-            def unexpected_read():
-                raise AssertionError("backstop should not read transcript after text was sent")
-
-            b._last_assistant_text = unexpected_read
+            b._last_assistant_text = lambda: "[tg] already sent"
+            b._last_backstop_key = "already-key"      # same message, same dedup key
+            b._drain_transcript = lambda: None
 
             b._finish_turn()
 
-            self.assertEqual(b.tg.sent, [(7, "already sent")])
+            self.assertEqual(b.tg.sent, [(7, "already sent")],
+                             "the turn's own already-forwarded final message was sent again")
             self.assertFalse(b._turn_active.is_set())
+
+
+class LateFinalAnswerAfterInterimTextTests(unittest.TestCase):
+    """T-0404: `_turn_text_sent` says "something went out this turn", not "the answer went out".
+    Once ANY interim message was forwarded, the old backstop (guarded by `not _turn_text_sent`)
+    never looked at the transcript again — so when the turn's real final answer landed in the
+    transcript in the SAME SECOND the turn ended (after the drain that would have forwarded it
+    had already run), it vanished with no forward, no warning, no log line at all. Measured
+    2026-09-21 22:36 and 2026-09-22 19:12:30.
+
+    These tests reproduce that exact shape: an interim text already forwarded this turn (so
+    `_turn_text_sent` is True and its key is in `_turn_sent_keys`), then a DIFFERENT final text
+    sitting in the transcript that this turn never forwarded."""
+
+    def setUp(self):
+        self._retry_delay = attach_mod.BACKSTOP_RETRY_DELAY
+        attach_mod.BACKSTOP_RETRY_DELAY = 0.0
+
+    def tearDown(self):
+        attach_mod.BACKSTOP_RETRY_DELAY = self._retry_delay
+
+    def test_final_answer_written_after_the_last_drain_is_still_delivered(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._turn_text_sent = True                       # an interim reply already went out
+            b._turn_sent_keys = {"interim-key"}
+            b._sent_keys.add("interim-key")
+            b.tg.sent.append((7, "interim reply"))
+
+            # The turn's REAL final answer, written to the transcript after that drain already
+            # ran — the one race the old `not _turn_text_sent` guard could never see.
+            b._last_assistant_text = lambda: "[tg] the real final answer"
+            b._last_backstop_key = "final-key"
+            b._drain_transcript = lambda: None
+
+            b._finish_turn()
+
+            self.assertEqual(
+                b.tg.sent, [(7, "interim reply"), (7, "the real final answer")],
+                "the turn's real final answer, written after the interim text was sent, was lost",
+            )
+            self.assertFalse(b._turn_active.is_set())
+
+    def test_final_answer_already_queued_to_the_durable_outbox_is_not_sent_twice(self):
+        """`_turn_sent_keys` must cover a reply this turn already HANDED to the durable outbox,
+        even before Telegram confirms it — `_sent_keys` alone is marked too late for this check
+        (it is only set once the outbox/Telegram send actually succeeds), so relying on it here
+        would re-queue a reply still sitting in the outbox."""
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._turn_text_sent = True
+            b._turn_sent_keys = {"queued-key"}   # forwarded to the outbox by THIS turn already
+            # b._sent_keys stays empty on purpose: Telegram has not confirmed delivery yet
+
+            b._last_assistant_text = lambda: "[tg] the reply already queued"
+            b._last_backstop_key = "queued-key"  # same text, same key — this IS what was sent
+            b._drain_transcript = lambda: None
+
+            b._finish_turn()
+
+            self.assertEqual(b.tg.sent, [],
+                             "a reply already queued by this turn was forwarded a second time")
+
+    def test_terminal_originated_turn_is_never_late_final_forwarded(self):
+        """A turn that did not come from Telegram must stay silent, exactly like the original
+        backstop — the late-final check is not a new leak for local turns."""
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._turn_from_tg = False
+            b._turn_text_sent = True
+            b._turn_sent_keys = set()
+
+            b._last_assistant_text = lambda: "[tg] some local final text"
+            b._last_backstop_key = "local-key"
+            b._drain_transcript = lambda: None
+
+            b._finish_turn()
+
+            self.assertEqual(b.tg.sent, [], "a terminal-originated turn's text was forwarded")
+
+    def test_reaction_turn_stays_exempt_from_the_late_final_check(self):
+        """A turn opened by a reaction is a deliberate exemption from the backstop — the late-
+        final check must not quietly re-enable it."""
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._turn_is_reaction = True
+            b._turn_text_sent = True
+            b._turn_sent_keys = set()
+
+            b._last_assistant_text = lambda: "[tg] the agent's internal note"
+            b._last_backstop_key = "reaction-key"
+            b._drain_transcript = lambda: None
+
+            b._finish_turn()
+
+            self.assertEqual(b.tg.sent, [], "a reaction turn was forwarded by the late-final check")
 
 
 class ReactionTurnBackstopTests(unittest.TestCase):
