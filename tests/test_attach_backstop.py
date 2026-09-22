@@ -480,7 +480,15 @@ class DurableOutboxRepliesAreNotResentByTheLateFinalCheckTests(unittest.TestCase
     measured. This one turns the durable outbox ON and drives a REAL `DurableOutbox`: the interim
     reply is genuinely enqueued to disk and NOT yet confirmed by Telegram (`_sent_keys` stays
     empty), and the late-final check at turn end must recognise it as already forwarded — from
-    `_turn_sent_keys`/the real outbox record — and not resend it."""
+    `_turn_sent_keys`/the real outbox record — and not resend it.
+
+    First cut of this test was green even with `_turn_forwarded` disabled entirely (as if the
+    turn's key check did not exist), because `DurableOutbox.enqueue()` has its OWN dedup by key
+    and silently absorbed the "duplicate" — so the test measured `durable.py`, not this fix. It
+    asserts on the log line now, which pins WHICH branch ran: "nothing left to send" (the key was
+    recognised as already forwarded, the check that actually belongs to this fix) versus "late
+    final → forwarded" (the check thought it was new and tried to resend it, and got saved only by
+    the outbox's own dedup)."""
 
     def test_reply_genuinely_enqueued_to_the_durable_outbox_is_not_resent(self):
         with tempfile.TemporaryDirectory() as d:
@@ -507,14 +515,134 @@ class DurableOutboxRepliesAreNotResentByTheLateFinalCheckTests(unittest.TestCase
             self.assertEqual(b.tg.sent, [], "the outbox consumer, not the producer, must send")
             self.assertTrue(b._turn_text_sent)
 
-            b._finish_turn()
+            with self.assertLogs("agent2telegram.attach", level="INFO") as logs:
+                b._finish_turn()
 
+            self.assertTrue(
+                any("TURN END late final: nothing left to send" in line for line in logs.output),
+                "the late-final check did not recognise the queued reply as already forwarded by "
+                "THIS turn — with the key check disabled it would still look clean here, because "
+                "durable.py's own enqueue() dedup absorbs the resend silently",
+            )
+            self.assertFalse(
+                any("TURN END late final → forwarded" in line for line in logs.output),
+                "the late-final check tried to resend a reply already sitting in the outbox — "
+                "only durable.py's own key dedup kept it from going out twice",
+            )
             self.assertEqual(b.tg.sent, [],
                              "a reply already sitting in the durable outbox was forwarded again "
                              "by the late-final check")
             still_queued = b._ensure_outbox().head()
             self.assertIsNotNone(still_queued,
                                  "the late-final check must not touch a record it did not send")
+
+
+class TechnicalBubbleIsClearedAfterTheLateFinalDrainTests(unittest.TestCase):
+    """N1 (03d3f1d): the drain `_unsent_final_text()` runs at turn end can hand `_handle_event` a
+    `tool_use` record — AFTER the `_status_clear()` at the top of `_finish_turn()`, and while
+    `_turn_active` is still set (it is not cleared until the very end). Nothing used to clear the
+    bubble `_status_push()` creates for it there: the turn's Telegram origin drops a few lines
+    below, so no LATER drain may touch it either, and it hung in the chat under the answer until
+    the next Telegram turn ended or a restart swept the orphan — a recurrence of the 2026-08-02
+    "stuck bubble" incident through a different door.
+
+    Measured on 6b5f8ec (before this fix): ``status {'mid': 55, 'shown': '🛠️ make build'}``,
+    ``deleted []``.
+
+    Needs a client with `send_plain_id`/`edit_plain` (the status-bubble API) — the
+    `tests.test_attach_backstop._FakeClient`, not `tests.test_v2_durability._Client` that
+    `_regrese_bridge()` wires in by default."""
+
+    def test_bubble_created_by_the_late_final_drain_is_cleared(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _regrese_bridge(d)
+            b.tg = _FakeClient()
+            transcript = Path(d) / "transcript.jsonl"
+            b._transcript = transcript
+            b._tpos = 0
+            b._tg_since = 0
+            b._turn_active.set()
+            b._turn_from_tg = False
+            b._turn_text_sent = False
+
+            _write_transcript(transcript, [
+                _user_record("[TG] build it"),
+                _assistant_record("[tg] working on it..."),
+            ])
+            b._drain_transcript()
+            self.assertEqual(b.tg.sent, [(7, "working on it...")],
+                             "test setup is wrong: the interim text should have forwarded")
+
+            # ONE assistant record carrying both the turn's real final text and a tool call —
+            # written after the interim drain already ran. The reader emits text first, then the
+            # tool call, so the late-final drain forwards the final answer AND pushes a technical
+            # bubble for the tool call, in that order, inside the same _finish_turn().
+            _append_transcript(transcript, [{
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "[tg] done building"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                     "input": {"description": "make build"}},
+                ]},
+            }])
+
+            b._finish_turn()
+
+            self.assertIn((7, "done building"), b.tg.sent,
+                          "test setup is wrong: the late final text should still have forwarded")
+            self.assertEqual(b._status, {"mid": None, "shown": ""},
+                             "the technical bubble the late-final drain created was left behind")
+            self.assertIn((7, 55), b.tg.deleted,
+                          "the technical bubble created by the late-final drain was never deleted")
+
+
+class DrainFailureInsideTheLateFinalCheckIsLoudTests(unittest.TestCase):
+    """N2 (03d3f1d): a `_drain_transcript()` failure inside `_unsent_final_text()`'s retry loop
+    used to log at DEBUG — below the operational floor — even though `_drain_transcript` moves
+    `_tpos` past the WHOLE chunk it read before it processes a single record, so a failure there
+    loses everything in that chunk except whatever the tail scan can still recover. The very same
+    failure from the outbound loop's own drain call logs as ERROR; this one is now WARNING."""
+
+    def setUp(self):
+        self._retry_delay = attach_mod.BACKSTOP_RETRY_DELAY
+        attach_mod.BACKSTOP_RETRY_DELAY = 0.0
+
+    def tearDown(self):
+        attach_mod.BACKSTOP_RETRY_DELAY = self._retry_delay
+
+    def test_drain_failure_logs_a_warning_and_the_turn_still_finishes(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._turn_text_sent = True                 # an interim reply already went out
+            b._turn_sent_keys = {"interim-key"}
+            b._sent_keys.add("interim-key")
+            b.tg.sent.append((7, "interim reply"))
+
+            def broken_drain():
+                raise OSError("transcript file vanished mid-read")
+
+            b._drain_transcript = broken_drain
+            # The tail scan is the only thing left once the drain is broken — it must still find
+            # and deliver the turn's real final answer.
+            b._last_assistant_text = lambda: "[tg] the real final answer"
+            b._last_backstop_key = "final-key"
+
+            with self.assertLogs("agent2telegram.attach", level="WARNING") as logs:
+                b._finish_turn()
+
+            self.assertTrue(
+                any("turn-end final check: transcript drain failed" in line
+                    for line in logs.output),
+                "a broken drain inside the late-final check must be logged at WARNING, not "
+                "swallowed at DEBUG below the operational floor",
+            )
+            self.assertEqual(
+                b.tg.sent, [(7, "interim reply"), (7, "the real final answer")],
+                "the turn's real final answer must still arrive via the tail scan even when the "
+                "drain inside the late-final check is broken",
+            )
+            self.assertFalse(b._turn_active.is_set(), "the turn must still finish despite the "
+                             "drain failure")
 
 
 class ReactionTurnBackstopTests(unittest.TestCase):
