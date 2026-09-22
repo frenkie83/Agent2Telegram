@@ -367,6 +367,100 @@ class LateFinalCheckDrainsBeforeScanningTests(unittest.TestCase):
             )
 
 
+class LateFinalCheckWaitsOnlyForADefinitiveEndTests(unittest.TestCase):
+    """23a2e65 — Codex review, high finding. The retry loop only waited when the transcript
+    already held undrained bytes (`_transcript_size() > _tpos`). When the turn's final answer had
+    not STARTED writing yet at the moment of the first read, that looked exactly like "the turn
+    had nothing left to say" (size == _tpos), the loop broke on the very first attempt, and the
+    answer was lost even though it arrived a fraction of a second later. `definitive` now decides
+    whether to wait even without growth: a Stop-hook / task_complete end means the answer exists
+    somewhere, so it is worth waiting for; a non-definitive end (idle fallback, a suspiciously
+    fast signal) means the turn has not really ended, so waiting would only park the outbound
+    thread — and with it every OTHER delivery — for nothing.
+
+    Real transcript file, real `ClaudeCodeReader`; the concurrent write is simulated the same way
+    tests/test_definitive_konec_tahu.py's `TurnSeqGuardsAFinishingBackstopTests` simulates a
+    concurrent new turn: by monkeypatching `_wait_backstop_retry` to perform the action that, in
+    production, happens on a different thread while this one sleeps — deterministic, no threads,
+    no reliance on wall-clock timing."""
+
+    def setUp(self):
+        self._retry_delay = attach_mod.BACKSTOP_RETRY_DELAY
+        attach_mod.BACKSTOP_RETRY_DELAY = 0.0
+
+    def tearDown(self):
+        attach_mod.BACKSTOP_RETRY_DELAY = self._retry_delay
+
+    def test_a_definitive_end_waits_for_a_final_answer_that_has_not_started_writing_yet(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _regrese_bridge(d)
+            transcript = Path(d) / "transcript.jsonl"
+            b._transcript = transcript
+            b._tpos = 0
+            b._tg_since = 0
+            b._turn_active.set()
+            b._turn_from_tg = False
+            b._turn_text_sent = False
+
+            _write_transcript(transcript, [
+                _user_record("[TG] status please"),
+                _assistant_record("[tg] pracuju"),
+            ])
+            b._drain_transcript()
+            self.assertEqual(b.tg.sent, ["pracuju"],
+                             "test setup is wrong: the interim text should have forwarded")
+            # Nothing undrained at this point — the file has NOT grown since the last drain, the
+            # exact state that used to make the old check give up on its very first look.
+            self.assertEqual(b._transcript_size(), b._tpos,
+                             "test setup is wrong: the transcript must be fully drained here")
+
+            def _final_answer_starts_writing_during_the_wait():
+                _append_transcript(transcript, [_assistant_record("[tg] ZAVER PSANY POZDE")])
+
+            b._wait_backstop_retry = _final_answer_starts_writing_during_the_wait
+
+            b._finish_turn()                          # definitive=True by default
+
+            self.assertEqual(
+                b.tg.sent, ["pracuju", "ZAVER PSANY POZDE"],
+                "a definitive end must wait for the final answer even when the transcript had "
+                "not grown yet at the first read",
+            )
+
+    def test_a_non_definitive_end_never_waits(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _regrese_bridge(d)
+            transcript = Path(d) / "transcript.jsonl"
+            b._transcript = transcript
+            b._tpos = 0
+            b._tg_since = 0
+            b._turn_active.set()
+            b._turn_from_tg = False
+            b._turn_text_sent = False
+
+            _write_transcript(transcript, [
+                _user_record("[TG] status please"),
+                _assistant_record("[tg] pracuju"),
+            ])
+            b._drain_transcript()
+            self.assertEqual(b.tg.sent, ["pracuju"],
+                             "test setup is wrong: the interim text should have forwarded")
+
+            waits = []
+            b._wait_backstop_retry = lambda: waits.append(1)
+
+            b._finish_turn(definitive=False)
+
+            # Counted, not timed — wall-clock is unreliable in a test, and the point is not "it
+            # was fast", it is "the wait path was never entered at all".
+            self.assertEqual(
+                waits, [],
+                "a non-definitive end (idle fallback / suspiciously fast signal) must never wait "
+                "— the turn has not really ended, and waiting would park the outbound loop for "
+                "nothing",
+            )
+
+
 class LateFinalCheckReaderMemoryIsPreservedTests(unittest.TestCase):
     """c51dfe4: the tail scan inside `_last_assistant_text()` now runs the reader's `parse()`
     under `_reader_unchanged()`. `CodexReader` keeps a bounded `deque` of the last few message
@@ -743,6 +837,73 @@ class TurnSeqGuardsTheLateFinalCleanupTests(unittest.TestCase):
             self.assertIn((7, 77), b.tg.deleted,
                           "the finishing turn's own bubble, created during the same wait, was "
                           "never cleared — the seq guard must not mean cleanup stops altogether")
+
+    def test_a_new_turns_pending_turn_end_survives_the_old_turn_finishing(self):
+        """23a2e65 — Codex review, medium finding. The drain inside the late-final check can read
+        the NEW turn's own `turn_end` marker (Codex writes `task_complete` to the rollout) while
+        the OLD turn is still finishing. Dropping `_pending_turn_end` / consuming the `_turn_end`
+        marker file unconditionally threw the new turn's own end away: it never finishes
+        definitively, its Telegram origin never lowers, and the next purely local output in the
+        pane would leak into the chat. `_pending_turn_end = False` and `_consume_turn_end()` are
+        now guarded by the same `_turn_seq == seq_at_entry` check as the rest of this cleanup."""
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._turn_text_sent = True
+            b._turn_sent_keys = {"interim-key"}
+            b._sent_keys.add("interim-key")
+            b.tg.sent.append((7, "interim reply"))
+            b._turn_end = Path(d) / "turn_end"
+            seq_at_entry = b._turn_seq = 1
+
+            def _new_turns_task_complete_is_read_mid_check():
+                # Stands in for the drain: the NEW turn's own end-of-turn signal shows up while
+                # this _finish_turn() (belonging to the OLD turn) is still inside the check.
+                b._turn_seq = seq_at_entry + 1
+                b._pending_turn_end = True
+                b._turn_end.write_text("", "utf-8")
+                b._last_backstop_key = "final-key"
+                return "[tg] the real final answer"
+
+            b._last_assistant_text = _new_turns_task_complete_is_read_mid_check
+            b._drain_transcript = lambda: None
+
+            b._finish_turn()
+
+            self.assertTrue(b._pending_turn_end,
+                            "the finishing turn discarded the NEW turn's own end-of-turn signal")
+            self.assertTrue(b._turn_end.exists(),
+                            "the finishing turn consumed the NEW turn's own end-of-turn marker "
+                            "file")
+
+    def test_without_a_turn_seq_change_the_pending_turn_end_is_still_consumed(self):
+        """Negative control for the guard above, measured from the other side: with NO new turn
+        opening in between, the finishing turn's own end-of-turn bookkeeping must still be
+        cleared — the guard must not mean this cleanup stops altogether either."""
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._turn_text_sent = True
+            b._turn_sent_keys = {"interim-key"}
+            b._sent_keys.add("interim-key")
+            b.tg.sent.append((7, "interim reply"))
+            b._turn_end = Path(d) / "turn_end"
+            b._turn_seq = 1
+
+            def _this_turns_own_end_marker_is_read():
+                b._pending_turn_end = True
+                b._turn_end.write_text("", "utf-8")
+                b._last_backstop_key = "final-key"
+                return "[tg] the real final answer"
+
+            b._last_assistant_text = _this_turns_own_end_marker_is_read
+            b._drain_transcript = lambda: None
+
+            b._finish_turn()
+
+            self.assertFalse(b._pending_turn_end,
+                             "the guard blocked cleanup even though no new turn ever started")
+            self.assertFalse(b._turn_end.exists(),
+                             "the guard blocked consuming the finishing turn's own end-of-turn "
+                             "marker file")
 
 
 class ReactionTurnBackstopTests(unittest.TestCase):
