@@ -1861,7 +1861,8 @@ class AttachBridge:
                 or key in getattr(self, "_turn_sent_keys", ())
                 or key in getattr(self, "_sent_keys", ()))
 
-    def _unsent_final_text(self, forwarded: set) -> tuple[str | None, str | None]:
+    def _unsent_final_text(self, forwarded: set, *, definitive: bool = True
+                           ) -> tuple[str | None, str | None]:
         """(text, key) of the transcript's last assistant message when this turn has NOT forwarded
         it, else (None, None).
 
@@ -1873,7 +1874,15 @@ class AttachBridge:
         later drain would send it a second time.
 
         Why it re-scans at all: the final text and the end of the turn land in the same second, so
-        the first look can still hit the file mid-write."""
+        the first look can still hit the file mid-write — or the write may not have STARTED yet,
+        which looks exactly like a finished turn with nothing to add. `definitive` decides how
+        patient to be, because it is the difference between "the agent is done" and "the agent has
+        been quiet for a while":
+          * a definitive end (Claude's Stop hook, Codex's task_complete) means the answer exists,
+            so the check waits for it even when the file has not grown yet;
+          * a non-definitive end fires WHILE the agent still works, and whatever it writes later is
+            forwarded by the normal path anyway — waiting there would only park the outbound
+            thread at every idle fallback, for nothing."""
         for attempt in range(LATE_FINAL_RETRY_ATTEMPTS):
             try:
                 self._drain_transcript()
@@ -1895,13 +1904,15 @@ class AttachBridge:
                                 "not forwarding %r", text[:30])
                     return None, None
                 return text, key
-            # Wait ONLY when the transcript holds bytes the drain has not consumed — that is the
-            # one shape where waiting can change the answer (the final line is mid-write, so it
-            # parses as nothing). With everything drained there is nothing in flight, and an
-            # unconditional wait would put its delay on the end of EVERY answered turn, which
-            # blocks the outbound loop and with it the next turn's forwarding.
+            # Undrained bytes mean a record is mid-write, so waiting is obviously worth it. On a
+            # definitive end it is worth it even without them: the answer may not have reached the
+            # file at all yet, and that state is indistinguishable from "the turn had nothing more
+            # to say" (measured by the foreign review, 2026-09-22). On a non-definitive end the
+            # turn is not over, so the wait would buy nothing and would park the outbound loop —
+            # and with it every delivery — at every idle fallback.
             if (attempt == LATE_FINAL_RETRY_ATTEMPTS - 1
-                    or self._transcript_size() <= getattr(self, "_tpos", 0)):
+                    or not (definitive
+                            or self._transcript_size() > getattr(self, "_tpos", 0))):
                 break
             self._wait_backstop_retry()
         return None, None
@@ -1986,7 +1997,7 @@ class AttachBridge:
             # dedup key — without it the normal path and this one send the same text twice
             # (proven 2026-08-02).
             forwarded = set(getattr(self, "_turn_sent_keys", ()) or ())
-            text, key = self._unsent_final_text(forwarded)
+            text, key = self._unsent_final_text(forwarded, definitive=definitive)
             out = self._strip_marker(text) if text else ""
             if out and key:
                 self._send_final(out, key=key)
@@ -1995,8 +2006,12 @@ class AttachBridge:
             else:
                 # Says what the check FOUND, not that it ran: a turn-end check whose quiet
                 # outcome looks exactly like a broken one is how T-0404 stayed invisible for a day.
-                log.info("TURN END late final: nothing left to send (last transcript key=%s)",
-                         getattr(self, "_last_backstop_key", None))
+                # `definitive` is in the line because it says how hard the check looked: a
+                # non-definitive end does not wait for a write that has not started, so "nothing
+                # left to send" means something different there.
+                log.info("TURN END late final: nothing left to send "
+                         "(last transcript key=%s definitive=%s)",
+                         getattr(self, "_last_backstop_key", None), definitive)
         # Both of these belong to THE TURN THAT WAS FINISHING, and only to it. Between this
         # method's entry and this line it can have WAITED — the backstop and the final check both
         # read the transcript and sleep for it — and a Telegram message arriving in that window
@@ -2034,8 +2049,14 @@ class AttachBridge:
         if definitive and getattr(self, "_turn_seq", 0) == seq_at_entry:
             self._turn_from_tg = False
             self._tg_since = 0
-        self._pending_turn_end = False
-        self._consume_turn_end()
+        # Same guard, same reason, and the foreign review measured why it belongs here too: the
+        # drain inside the checks above can read the NEW turn's `turn_end` (Codex writes
+        # task_complete to the rollout) and raise this flag for it. Dropping it unconditionally
+        # means the new turn never ends definitively — its Telegram origin is never lowered, and
+        # the next purely local output in the pane is forwarded into the chat.
+        if getattr(self, "_turn_seq", 0) == seq_at_entry:
+            self._pending_turn_end = False
+            self._consume_turn_end()
         if was_active:
             # from_tg/text_sent are in the line on purpose: when a reply goes missing, these two
             # flags decide whether anything was even attempted, and reconstructing them
