@@ -645,6 +645,106 @@ class DrainFailureInsideTheLateFinalCheckIsLoudTests(unittest.TestCase):
                              "drain failure")
 
 
+class TurnSeqGuardsTheLateFinalCleanupTests(unittest.TestCase):
+    """3f6be5a — Codex review, high finding. `_finish_turn` runs on the outbound thread and can
+    WAIT inside `_unsent_final_text()`: it drains and sleeps for a record still being written. If
+    a Telegram message lands in that window, the inbound thread opens a NEW turn — bumps
+    `_turn_seq`, sets `_turn_active`, and that new turn gets its own status bubble as ITS OWN
+    drain forwards a tool call. The OLD turn, still sitting in the late-final check, used to reach
+    the bottom of `_finish_turn()` and unconditionally clear `_turn_active` and the status bubble
+    — taking away the NEW turn's typing indicator and bubble. At the new turn's own end,
+    `was_active` then reads False, so NEITHER backstop runs and ITS final answer is lost without a
+    trace: the exact defect this whole file exists to close, reproduced by the fix meant to close
+    it. `_status_clear()`/`_turn_active.clear()` are now guarded by the same `_turn_seq ==
+    seq_at_entry` check `_turn_from_tg`/`_tg_since` already had.
+
+    Placed here rather than next to `TurnSeqGuardsAFinishingBackstopTests` in
+    test_definitive_konec_tahu.py: that class drives the guard through a heavier real-transcript-
+    via-`_handle()` harness for the OLD backstop path (`_retry_last_assistant_text`); this guards
+    the NEW late-final branch (`_unsent_final_text`) that the rest of this file's `LateFinalCheck*`
+    classes already measure with the lightweight `_bridge()` harness and stubbed
+    `_last_assistant_text`/`_drain_transcript` — reproducing the heavier harness here for one
+    shared guard line would not buy more assurance, so this follows the same deterministic,
+    thread-free simulation the rest of the file already uses."""
+
+    def setUp(self):
+        self._retry_delay = attach_mod.BACKSTOP_RETRY_DELAY
+        attach_mod.BACKSTOP_RETRY_DELAY = 0.0
+
+    def tearDown(self):
+        attach_mod.BACKSTOP_RETRY_DELAY = self._retry_delay
+
+    def test_a_turn_that_begins_during_the_late_final_wait_keeps_its_own_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._turn_text_sent = True                 # an interim reply already went out
+            b._turn_sent_keys = {"interim-key"}
+            b._sent_keys.add("interim-key")
+            b.tg.sent.append((7, "interim reply"))
+            seq_at_entry = b._turn_seq = 1
+
+            def _new_turn_begins_while_the_old_one_waits():
+                # Stands in for the inbound thread: a Telegram message lands WHILE this
+                # _finish_turn() is still inside _unsent_final_text(), opens a brand-new turn
+                # (_begin_turn() bumps _turn_seq and sets _turn_active), which then gets its OWN
+                # status bubble from its own drain forwarding a tool call.
+                b._turn_seq = seq_at_entry + 1
+                b._turn_active.set()
+                b._status = {"mid": 55, "shown": "🛠️ the new turn's own tool call"}
+                b._last_backstop_key = "final-key"
+                return "[tg] the real final answer"
+
+            b._last_assistant_text = _new_turn_begins_while_the_old_one_waits
+            b._drain_transcript = lambda: None
+
+            b._finish_turn()
+
+            self.assertTrue(
+                b._turn_active.is_set(),
+                "the finishing turn cleared _turn_active out from under the NEW turn that began "
+                "while it was still waiting inside the late-final check",
+            )
+            self.assertEqual(
+                b._status, {"mid": 55, "shown": "🛠️ the new turn's own tool call"},
+                "the finishing turn deleted the NEW turn's own status bubble",
+            )
+            self.assertEqual(b.tg.deleted, [],
+                             "the new turn's status bubble was deleted by the OLD turn finishing")
+
+    def test_without_a_turn_seq_change_the_old_turns_own_bubble_is_still_cleared(self):
+        """Negative control for the guard above, measured from the other side: with the
+        finishing turn's OWN bubble appearing during the same late-final wait (its own drain
+        forwarding a tool_use record) and NO new turn opening in between, the second cleanup must
+        still run — the guard must not quietly turn into "the second cleanup never happens"."""
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._turn_text_sent = True
+            b._turn_sent_keys = {"interim-key"}
+            b._sent_keys.add("interim-key")
+            b.tg.sent.append((7, "interim reply"))
+            b._turn_seq = 1
+
+            def _own_bubble_appears_but_no_new_turn_starts():
+                # Same shape as the drain inside _unsent_final_text() pushing a bubble for a
+                # tool_use record belonging to THIS turn — _turn_seq stays put, nothing new began.
+                b._status = {"mid": 77, "shown": "🛠️ this turn's own tool call"}
+                b._last_backstop_key = "final-key"
+                return "[tg] the real final answer"
+
+            b._last_assistant_text = _own_bubble_appears_but_no_new_turn_starts
+            b._drain_transcript = lambda: None
+
+            b._finish_turn()
+
+            self.assertFalse(b._turn_active.is_set(),
+                             "the guard blocked cleanup even though no new turn ever started")
+            self.assertEqual(b._status, {"mid": None, "shown": ""},
+                             "the guard blocked the finishing turn's own bubble cleanup")
+            self.assertIn((7, 77), b.tg.deleted,
+                          "the finishing turn's own bubble, created during the same wait, was "
+                          "never cleared — the seq guard must not mean cleanup stops altogether")
+
+
 class ReactionTurnBackstopTests(unittest.TestCase):
     """A heart always deserves a short answer, and it must never be answered with the agent's
     INTERNAL text. The prompt asks for a one-liner; the backstop exemption is the safety net for
