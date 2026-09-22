@@ -15,6 +15,7 @@ This keeps the agent's full session (context, persona, tools) and adds Telegram 
 from __future__ import annotations
 
 from collections import deque
+import copy
 import glob
 import html
 import json
@@ -92,6 +93,12 @@ TYPING_INTERVAL = 1.5
 # (especially after a reset/reconnect), so give the final assistant text a short chance to land.
 BACKSTOP_RETRY_ATTEMPTS = 5
 BACKSTOP_RETRY_DELAY = 0.35
+#: The same race from the other side: a turn that DID forward something can still lose its LAST
+#: message, because the final text lands in the transcript in the very second the turn ends
+#: (measured 2026-09-21 22:36 and 2026-09-22 19:12:30) — after the drain that would have sent it.
+#: Fewer attempts than the backstop above on purpose: this check runs at the end of EVERY answered
+#: Telegram turn and it holds the outbound loop while it waits.
+LATE_FINAL_RETRY_ATTEMPTS = 3
 
 #: Codex only: hold the first scraped tool bubble until the turn's intro text has been forwarded
 #: (agents usually say what they'll do, THEN call the tool). The scraper is live but the Codex
@@ -329,6 +336,7 @@ class AttachBridge:
         self._seen_tools: set = set()
         self._tui_seen: set = set()          # Codex TUI scrape: tool lines already shown this turn
         self._turn_text_sent = False         # has any text been forwarded this turn (bubble gate)
+        self._turn_sent_keys: set = set()    # dedup ids of the texts THIS turn forwarded
         self._turn_is_reaction = False       # turn opened by a reaction → exempt from the backstop
 
     # ---- transcript resolution --------------------------------------------
@@ -808,6 +816,11 @@ class AttachBridge:
             return
         if key and key in self._sent_keys:
             return
+        if key and turn_text:
+            # Remember WHICH text went out, not just THAT something did. `_sent_keys` is marked
+            # only after Telegram confirms, so a reply already durably queued would look unsent to
+            # the turn-end check below and be queued a second time.
+            self._note_turn_key(key)
         # Voice-reply mode: speak the reply as a Telegram voice note. Best-effort ENHANCEMENT —
         # a too-long reply or ANY failure falls straight through to the durable TEXT path below,
         # so voice mode can NEVER make a reply not arrive (that is the whole point of v2).
@@ -1402,6 +1415,7 @@ class AttachBridge:
         self._max_gap = 0.0
         self._last_typing = now
         self._turn_text_sent = False             # gate TUI bubbles until intro text lands
+        self._turn_sent_keys = set()             # which texts this turn forwarded (turn-end check)
         self._turn_is_reaction = False           # set by the reaction branch right after this
         # Clear any end-of-turn signal left over from the PREVIOUS turn. Codex writes
         # task_complete to the rollout with a delay, so a late one could land after the next
@@ -1743,23 +1757,51 @@ class AttachBridge:
             return None
         last = None
         last_key = None                              # transcript with no assistant text at all
-        for raw in tail.split(b"\n"):
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line.decode("utf-8", "ignore"))
-            except (ValueError, json.JSONDecodeError):
-                continue
-            try:
-                for ev in self._reader.parse(rec):
-                    if ev.kind == "text" and ev.text and ev.text.strip():
-                        last = ev.text
-                        last_key = ev.key            # dedup id of that very message
-            except Exception:
-                continue
+        with self._reader_unchanged():
+            for raw in tail.split(b"\n"):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8", "ignore"))
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                try:
+                    for ev in self._reader.parse(rec):
+                        if ev.kind == "text" and ev.text and ev.text.strip():
+                            last = ev.text
+                            last_key = ev.key        # dedup id of that very message
+                except Exception:
+                    continue
         self._last_backstop_key = last_key
         return last
+
+    @contextmanager
+    def _reader_unchanged(self):
+        """Run a READ-ONLY re-read without moving the reader's memory. Readers are stateful:
+        CodexReader keeps a window of the last 8 message hashes so a Codex <= 0.144 double-log is
+        not sent twice. A tail scan re-reads records the drain already consumed, and feeding them
+        into that window shifts it — which decides whether the NEXT real message is taken for a
+        duplicate and dropped. The scan is a question, and a question must not change the answer.
+
+        The whole instance dictionary is saved, not the attributes we happen to know about today:
+        reader state belongs to `readers.py`, and a set or a counter added there later would
+        silently fall outside a narrower guard — and the symptom would be a dropped message, not
+        a red test."""
+        reader = getattr(self, "_reader", None)
+        saved = None
+        if reader is not None:
+            try:
+                saved = copy.deepcopy(vars(reader))
+            except Exception as e:      # a reader holding something uncopyable (a lock, a handle)
+                log.warning("reader state could not be snapshotted, the tail scan may shift its "
+                            "dedup window: %s", e)
+        try:
+            yield
+        finally:
+            if saved is not None:
+                vars(reader).clear()
+                vars(reader).update(saved)
 
     def _wait_backstop_retry(self) -> None:
         stop = getattr(self, "_stop", None)
@@ -1798,6 +1840,82 @@ class AttachBridge:
         except OSError:
             return None
         return answer or None
+
+    def _note_turn_key(self, key: str) -> None:
+        keys = getattr(self, "_turn_sent_keys", None)
+        if keys is None:
+            keys = set()
+            self._turn_sent_keys = keys
+        keys.add(key)
+
+    def _turn_forwarded(self, key: str | None, forwarded: "set | None" = None) -> bool:
+        """Has this message already been handed to the delivery path? `_turn_sent_keys` covers
+        this turn (including replies still sitting in the durable outbox), `_sent_keys` covers
+        everything Telegram has already confirmed, in this turn or an earlier one. `forwarded` is
+        the snapshot taken when the turn ended: a turn that STARTS while this check waits empties
+        the live set, and without the snapshot this turn's own last reply would look unsent and go
+        out a second time (same race the `_turn_seq` guard below exists for)."""
+        if not key:
+            return False
+        return (key in (forwarded or ())
+                or key in getattr(self, "_turn_sent_keys", ())
+                or key in getattr(self, "_sent_keys", ()))
+
+    def _unsent_final_text(self, forwarded: set, *, definitive: bool = True
+                           ) -> tuple[str | None, str | None]:
+        """(text, key) of the transcript's last assistant message when this turn has NOT forwarded
+        it, else (None, None).
+
+        Every attempt DRAINS FIRST, and that is what keeps the order and the count right: the
+        drain forwards every COMPLETE record the normal way — all of them, oldest first, and it
+        moves the cursor past them. The tail scan then only has to catch what a drain cannot see,
+        a record still being written. Scanning without draining would deliver the LAST text and
+        silently drop anything written before it, and would leave `_tpos` behind that record, so a
+        later drain would send it a second time.
+
+        Why it re-scans at all: the final text and the end of the turn land in the same second, so
+        the first look can still hit the file mid-write — or the write may not have STARTED yet,
+        which looks exactly like a finished turn with nothing to add. `definitive` decides how
+        patient to be, because it is the difference between "the agent is done" and "the agent has
+        been quiet for a while":
+          * a definitive end (Claude's Stop hook, Codex's task_complete) means the answer exists,
+            so the check waits for it even when the file has not grown yet;
+          * a non-definitive end fires WHILE the agent still works, and whatever it writes later is
+            forwarded by the normal path anyway — waiting there would only park the outbound
+            thread at every idle fallback, for nothing."""
+        for attempt in range(LATE_FINAL_RETRY_ATTEMPTS):
+            try:
+                self._drain_transcript()
+            except Exception as e:
+                # WARNING, not debug: the same failure logs as an error when the outbound loop
+                # hits it, and it is a lost forward either way — `_drain_transcript` moves the
+                # cursor past the whole chunk before it handles the records, so everything in
+                # that chunk except the last text is gone for good. The tail scan below is the
+                # only thing left, and it must not look like a healthy turn.
+                log.warning("turn-end final check: transcript drain failed: %s", e)
+            text = self._last_assistant_text()
+            key = getattr(self, "_last_backstop_key", None)
+            if text and text.strip() and not self._turn_forwarded(key, forwarded):
+                if not key:
+                    # Today unreachable: both readers always produce a key (a uuid, or a hash of
+                    # the text). It is here for the reader that stops doing so — and it SAYS so,
+                    # because this whole check exists against silent drops.
+                    log.warning("turn-end final check: the last transcript text has no dedup id, "
+                                "not forwarding %r", text[:30])
+                    return None, None
+                return text, key
+            # Undrained bytes mean a record is mid-write, so waiting is obviously worth it. On a
+            # definitive end it is worth it even without them: the answer may not have reached the
+            # file at all yet, and that state is indistinguishable from "the turn had nothing more
+            # to say" (measured by the foreign review, 2026-09-22). On a non-definitive end the
+            # turn is not over, so the wait would buy nothing and would park the outbound loop —
+            # and with it every delivery — at every idle fallback.
+            if (attempt == LATE_FINAL_RETRY_ATTEMPTS - 1
+                    or not (definitive
+                            or self._transcript_size() > getattr(self, "_tpos", 0))):
+                break
+            self._wait_backstop_retry()
+        return None, None
 
     def _has_turn_end_backstop_source(self) -> bool:
         return (getattr(self, "_transcript", None) is not None
@@ -1863,7 +1981,56 @@ class AttachBridge:
             # Intended silence, but it must still be visible in the log — otherwise a genuinely
             # lost reply would look exactly the same in the daily traffic analysis.
             log.info("TURN END reaction turn without a reply (backstop deliberately skipped)")
-        self._turn_active.clear()
+        elif (was_active and self._turn_from_tg and self._turn_text_sent
+                and not getattr(self, "_turn_is_reaction", False)
+                and self._owner_chat is not None
+                and getattr(self, "_turn_end_backstop_enabled", True)
+                and getattr(self, "_transcript", None) is not None):
+            # The turn DID forward something — and that is exactly how its LAST message got lost.
+            # `_turn_text_sent` says "something went out", not "the answer went out": measured on
+            # 2026-09-21 22:36 and 2026-09-22 19:12:30, an interim message was delivered, the final
+            # answer was written into the transcript in the same second as the end of the turn, the
+            # drain that would have forwarded it had already run — and the Telegram origin dies a
+            # few lines below, so no later drain may touch it either. Silence, no warning, nothing
+            # in the journal (T-0404). So ask about the CONSEQUENCE: compare the last text in the
+            # transcript with what this turn actually sent and deliver the difference. WITH its
+            # dedup key — without it the normal path and this one send the same text twice
+            # (proven 2026-08-02).
+            forwarded = set(getattr(self, "_turn_sent_keys", ()) or ())
+            text, key = self._unsent_final_text(forwarded, definitive=definitive)
+            out = self._strip_marker(text) if text else ""
+            if out and key:
+                self._send_final(out, key=key)
+                log.info("TURN END late final → forwarded the turn's last text key=%s %r",
+                         key, out[:30])
+            else:
+                # Says what the check FOUND, not that it ran: a turn-end check whose quiet
+                # outcome looks exactly like a broken one is how T-0404 stayed invisible for a day.
+                # `definitive` is in the line because it says how hard the check looked: a
+                # non-definitive end does not wait for a write that has not started, so "nothing
+                # left to send" means something different there.
+                log.info("TURN END late final: nothing left to send "
+                         "(last transcript key=%s definitive=%s)",
+                         getattr(self, "_last_backstop_key", None), definitive)
+        # Both of these belong to THE TURN THAT WAS FINISHING, and only to it. Between this
+        # method's entry and this line it can have WAITED — the backstop and the final check both
+        # read the transcript and sleep for it — and a Telegram message arriving in that window
+        # opens a NEW turn on the inbound thread. Clearing then takes the new turn's own state
+        # away: no typing indicator, no bubble, and at its end `was_active` is False, so NEITHER
+        # backstop runs and its answer is lost with nothing in the log — the exact failure this
+        # file keeps closing. The Telegram origin below has carried this guard since the first
+        # time it happened; these two did not.
+        #
+        # The clear itself is the second one, and it is load-bearing: both turn-end paths above
+        # DRAIN, a drain hands a `tool_use` record to _handle_event, and that pushes a technical
+        # bubble — after the clear at the top of this method and while the turn still counts as
+        # active. Nothing would clear it afterwards (`_persist_status` writes its id to disk, the
+        # origin drops below), so the italic bubble hangs in the chat UNDER the answer until the
+        # next Telegram turn ends or a restart sweeps the orphan: the 2026-08-02 "stuck bubble"
+        # incident coming back through another door.
+        if getattr(self, "_turn_seq", 0) == seq_at_entry:
+            self._status_clear()
+            self._turn_active.clear()
         # A turn's Telegram origin DIES WITH AN ENDED TURN. Leaving it raised was not cosmetic: a
         # message typed into the tmux pane while a turn is finishing gets QUEUED by Claude Code
         # and lands in the transcript only as `attachment`/`queued_command`, which the reader
@@ -1882,8 +2049,14 @@ class AttachBridge:
         if definitive and getattr(self, "_turn_seq", 0) == seq_at_entry:
             self._turn_from_tg = False
             self._tg_since = 0
-        self._pending_turn_end = False
-        self._consume_turn_end()
+        # Same guard, same reason, and the foreign review measured why it belongs here too: the
+        # drain inside the checks above can read the NEW turn's `turn_end` (Codex writes
+        # task_complete to the rollout) and raise this flag for it. Dropping it unconditionally
+        # means the new turn never ends definitively — its Telegram origin is never lowered, and
+        # the next purely local output in the pane is forwarded into the chat.
+        if getattr(self, "_turn_seq", 0) == seq_at_entry:
+            self._pending_turn_end = False
+            self._consume_turn_end()
         if was_active:
             # from_tg/text_sent are in the line on purpose: when a reply goes missing, these two
             # flags decide whether anything was even attempted, and reconstructing them

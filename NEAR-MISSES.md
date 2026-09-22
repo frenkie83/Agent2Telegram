@@ -410,3 +410,42 @@ across the wrap and simply was not on that row. It would have deleted the durabl
 the very messages it was meant to protect, and its failure path re-typed the message up to
 fifteen times. **It was removed, not patched.** A safeguard against a failure nobody has
 reproduced, whose own failure modes are not measured either, is not a safeguard.
+
+---
+
+## 2026-09-21 · A turn that answered twice delivered only the first half
+
+**Not a near miss — this one reached the user, twice.** A Telegram turn forwarded an interim
+message, then wrote its real answer and ended. The answer never arrived. The journal held no
+warning of any kind; the turn's own line said `TURN END … text_sent=True`, which was true and
+useless.
+
+**What happened:** the turn-end backstop was guarded by `not _turn_text_sent` — "only rescue a
+turn that sent nothing". Once any interim message had gone out, the guard closed and the
+transcript was never looked at again. That is fine as long as the final text is forwarded by a
+drain, and it is, except when the final text lands in the transcript in the same second the turn
+ends: the drain that would have carried it has already run, and a few lines further down
+`_turn_from_tg` drops to False, so no later drain may touch it either. Measured twice — 22:36 on
+2026-09-21 and 19:12:30.718 on 2026-09-22, both with the text and `TURN END` in the same second.
+
+**Why it slipped through:** `_turn_text_sent` is a statement about the bridge's *state*, not about
+the *consequence*. It answers "did anything go out this turn", and it was read as "did the answer
+go out". The two differ exactly once per turn — on the last message, the one carrying the result.
+
+**What catches it now:** the end of a Telegram turn compares the key of the LAST assistant text in
+the transcript with the keys this turn actually handed to the delivery path, and forwards the
+difference with its dedup key. It asks about the consequence, not the state.
+
+**Three things the review added, each of them the same bug one step further out:**
+1. The check drains BEFORE it scans. Scanning first delivers only the last text, so two texts
+   arriving after the last drain meant the first one was lost — the original failure, moved along
+   by one message — and it left the cursor behind that record, so a later drain sent it twice.
+2. The tail scan no longer feeds the live reader. `CodexReader` remembers the last eight message
+   hashes to keep a Codex ≤ 0.144 double-log from being sent twice; a read-only re-read was
+   pushing already-seen records into that window, which decides whether the NEXT real message is
+   taken for a duplicate and dropped. A question must not change the answer.
+3. The check logs what it found even when it forwards nothing. A quiet healthy outcome and a
+   quiet broken one looked identical, which is how this survived a day of being looked for.
+
+**The rule worth keeping:** every flag that guards a delivery has to be read as what it literally
+records. `text_sent=True` proves a message was sent. It never proved that *this* message was.
