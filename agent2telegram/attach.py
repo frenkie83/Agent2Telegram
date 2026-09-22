@@ -15,6 +15,7 @@ This keeps the agent's full session (context, persona, tools) and adds Telegram 
 from __future__ import annotations
 
 from collections import deque
+import copy
 import glob
 import html
 import json
@@ -1781,16 +1782,26 @@ class AttachBridge:
         CodexReader keeps a window of the last 8 message hashes so a Codex <= 0.144 double-log is
         not sent twice. A tail scan re-reads records the drain already consumed, and feeding them
         into that window shifts it — which decides whether the NEXT real message is taken for a
-        duplicate and dropped. The scan is a question, and a question must not change the answer."""
+        duplicate and dropped. The scan is a question, and a question must not change the answer.
+
+        The whole instance dictionary is saved, not the attributes we happen to know about today:
+        reader state belongs to `readers.py`, and a set or a counter added there later would
+        silently fall outside a narrower guard — and the symptom would be a dropped message, not
+        a red test."""
         reader = getattr(self, "_reader", None)
-        saved = [(d, list(d)) for d in vars(reader).values()
-                 if isinstance(d, deque)] if reader is not None else []
+        saved = None
+        if reader is not None:
+            try:
+                saved = copy.deepcopy(vars(reader))
+            except Exception as e:      # a reader holding something uncopyable (a lock, a handle)
+                log.warning("reader state could not be snapshotted, the tail scan may shift its "
+                            "dedup window: %s", e)
         try:
             yield
         finally:
-            for d, items in saved:
-                d.clear()
-                d.extend(items)
+            if saved is not None:
+                vars(reader).clear()
+                vars(reader).update(saved)
 
     def _wait_backstop_retry(self) -> None:
         stop = getattr(self, "_stop", None)
@@ -1867,7 +1878,12 @@ class AttachBridge:
             try:
                 self._drain_transcript()
             except Exception as e:
-                log.debug("turn-end final check: transcript drain failed: %s", e)
+                # WARNING, not debug: the same failure logs as an error when the outbound loop
+                # hits it, and it is a lost forward either way — `_drain_transcript` moves the
+                # cursor past the whole chunk before it handles the records, so everything in
+                # that chunk except the last text is gone for good. The tail scan below is the
+                # only thing left, and it must not look like a healthy turn.
+                log.warning("turn-end final check: transcript drain failed: %s", e)
             text = self._last_assistant_text()
             key = getattr(self, "_last_backstop_key", None)
             if text and text.strip() and not self._turn_forwarded(key, forwarded):
@@ -1981,6 +1997,14 @@ class AttachBridge:
                 # outcome looks exactly like a broken one is how T-0404 stayed invisible for a day.
                 log.info("TURN END late final: nothing left to send (last transcript key=%s)",
                          getattr(self, "_last_backstop_key", None))
+        # Second clear, and it is load-bearing. Both turn-end paths above DRAIN, and a drain hands
+        # a `tool_use` record to _handle_event, which pushes a technical bubble — after the clear
+        # at the top of this method and while the turn still counts as active. Nothing clears it
+        # afterwards: `_persist_status` writes its id to disk, the turn's Telegram origin drops a
+        # few lines below, and the italic bubble then hangs in the chat UNDER the answer until the
+        # next Telegram turn ends, or until a restart sweeps the orphan. That is the 2026-08-02
+        # "stuck bubble" incident coming back through another door.
+        self._status_clear()
         self._turn_active.clear()
         # A turn's Telegram origin DIES WITH AN ENDED TURN. Leaving it raised was not cosmetic: a
         # message typed into the tmux pane while a turn is finishing gets QUEUED by Claude Code
