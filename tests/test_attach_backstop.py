@@ -9,6 +9,14 @@ from agent2telegram import attach as attach_mod
 from agent2telegram.attach import AttachBridge
 from agent2telegram.config import Config
 
+from tests.test_regrese_mostu import (
+    _assistant_record,
+    _regrese_bridge,
+    _user_record,
+    _write_transcript,
+)
+from tests.test_unik_do_chatu import _append_transcript
+
 
 class _FakeClient:
     def __init__(self):
@@ -258,6 +266,62 @@ class LateFinalAnswerAfterInterimTextTests(unittest.TestCase):
             b._finish_turn()
 
             self.assertEqual(b.tg.sent, [], "a reaction turn was forwarded by the late-final check")
+
+
+class LateFinalAnswerRealTranscriptAndReaderTests(unittest.TestCase):
+    """The five tests above all stub `_last_assistant_text` AND `_drain_transcript`, so none of
+    them exercises the drain cursor (`_tpos`), the tail scan from `_tg_since`, or a dedup key
+    actually produced by a reader — exactly the interaction T-0404 lives in (measured 2026-09-21
+    22:36 and 2026-09-22 19:12:30). This test drives a REAL `AttachBridge` through a REAL Claude
+    Code transcript file on disk and the real `ClaudeCodeReader` (same harness as
+    tests/test_regrese_mostu.py / tests/test_definitive_konec_tahu.py). Deterministic and
+    thread-free: no stub sits between `_drain_transcript()` / `_finish_turn()` and the file."""
+
+    def test_final_text_appended_after_the_interim_drain_still_arrives_exactly_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _regrese_bridge(d)
+            transcript = Path(d) / "transcript.jsonl"
+            b._transcript = transcript
+            b._tpos = 0
+            b._tg_since = 0
+            b._turn_active.set()
+            b._turn_from_tg = False
+            b._turn_text_sent = False
+
+            # The interim message: a real user record starting the turn, a real assistant text
+            # record right after it.
+            _write_transcript(transcript, [
+                _user_record("[TG] how's it going"),
+                _assistant_record("[tg] working on it..."),
+            ])
+            b._drain_transcript()
+
+            # Proof this measures the real path, not a stub: the interim text actually left the
+            # bridge through _handle_event → _send_final, and ITS OWN key (produced by the real
+            # reader from the transcript record, not handed in by the test) is what landed in
+            # _turn_sent_keys.
+            self.assertEqual(b.tg.sent, ["working on it..."],
+                             "the interim text did not forward through the real drain/reader path")
+            self.assertTrue(b._turn_text_sent)
+            self.assertTrue(getattr(b, "_turn_sent_keys", None),
+                             "the interim message's real reader-derived key never reached "
+                             "_turn_sent_keys")
+
+            # The turn's REAL final answer is appended to the transcript file AFTER that drain
+            # already ran — on disk, not through any stub — reproducing the exact shape measured
+            # in production: the final line lands after the drain that would have forwarded it.
+            _append_transcript(transcript, [
+                _assistant_record("[tg] done — here is the final answer"),
+            ])
+
+            b._finish_turn()
+
+            self.assertEqual(
+                b.tg.sent,
+                ["working on it...", "done — here is the final answer"],
+                "the turn's real final answer, appended to the transcript after the interim "
+                "drain, must arrive — exactly once",
+            )
 
 
 class ReactionTurnBackstopTests(unittest.TestCase):
