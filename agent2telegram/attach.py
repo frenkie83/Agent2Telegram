@@ -1997,15 +1997,25 @@ class AttachBridge:
                 # outcome looks exactly like a broken one is how T-0404 stayed invisible for a day.
                 log.info("TURN END late final: nothing left to send (last transcript key=%s)",
                          getattr(self, "_last_backstop_key", None))
-        # Second clear, and it is load-bearing. Both turn-end paths above DRAIN, and a drain hands
-        # a `tool_use` record to _handle_event, which pushes a technical bubble — after the clear
-        # at the top of this method and while the turn still counts as active. Nothing clears it
-        # afterwards: `_persist_status` writes its id to disk, the turn's Telegram origin drops a
-        # few lines below, and the italic bubble then hangs in the chat UNDER the answer until the
-        # next Telegram turn ends, or until a restart sweeps the orphan. That is the 2026-08-02
-        # "stuck bubble" incident coming back through another door.
-        self._status_clear()
-        self._turn_active.clear()
+        # Both of these belong to THE TURN THAT WAS FINISHING, and only to it. Between this
+        # method's entry and this line it can have WAITED — the backstop and the final check both
+        # read the transcript and sleep for it — and a Telegram message arriving in that window
+        # opens a NEW turn on the inbound thread. Clearing then takes the new turn's own state
+        # away: no typing indicator, no bubble, and at its end `was_active` is False, so NEITHER
+        # backstop runs and its answer is lost with nothing in the log — the exact failure this
+        # file keeps closing. The Telegram origin below has carried this guard since the first
+        # time it happened; these two did not.
+        #
+        # The clear itself is the second one, and it is load-bearing: both turn-end paths above
+        # DRAIN, a drain hands a `tool_use` record to _handle_event, and that pushes a technical
+        # bubble — after the clear at the top of this method and while the turn still counts as
+        # active. Nothing would clear it afterwards (`_persist_status` writes its id to disk, the
+        # origin drops below), so the italic bubble hangs in the chat UNDER the answer until the
+        # next Telegram turn ends or a restart sweeps the orphan: the 2026-08-02 "stuck bubble"
+        # incident coming back through another door.
+        if getattr(self, "_turn_seq", 0) == seq_at_entry:
+            self._status_clear()
+            self._turn_active.clear()
         # A turn's Telegram origin DIES WITH AN ENDED TURN. Leaving it raised was not cosmetic: a
         # message typed into the tmux pane while a turn is finishing gets QUEUED by Claude Code
         # and lands in the transcript only as `attachment`/`queued_command`, which the reader
