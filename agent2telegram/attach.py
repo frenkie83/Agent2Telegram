@@ -1828,7 +1828,7 @@ class AttachBridge:
         return (key in getattr(self, "_turn_sent_keys", ())
                 or key in getattr(self, "_sent_keys", ()))
 
-    def _unsent_final_text(self) -> "tuple[str | None, str | None]":
+    def _unsent_final_text(self) -> tuple[str | None, str | None]:
         """(text, key) of the transcript's last assistant message when this turn has NOT forwarded
         it, else (None, None).
 
