@@ -1,4 +1,5 @@
 """Tests for attach-mode turn-end backstop delivery."""
+import json
 import tempfile
 import threading
 import time
@@ -8,6 +9,7 @@ from pathlib import Path
 from agent2telegram import attach as attach_mod
 from agent2telegram.attach import AttachBridge
 from agent2telegram.config import Config
+from agent2telegram import readers
 
 from tests.test_regrese_mostu import (
     _assistant_record,
@@ -213,26 +215,6 @@ class LateFinalAnswerAfterInterimTextTests(unittest.TestCase):
             )
             self.assertFalse(b._turn_active.is_set())
 
-    def test_final_answer_already_queued_to_the_durable_outbox_is_not_sent_twice(self):
-        """`_turn_sent_keys` must cover a reply this turn already HANDED to the durable outbox,
-        even before Telegram confirms it — `_sent_keys` alone is marked too late for this check
-        (it is only set once the outbox/Telegram send actually succeeds), so relying on it here
-        would re-queue a reply still sitting in the outbox."""
-        with tempfile.TemporaryDirectory() as d:
-            b = _bridge(d)
-            b._turn_text_sent = True
-            b._turn_sent_keys = {"queued-key"}   # forwarded to the outbox by THIS turn already
-            # b._sent_keys stays empty on purpose: Telegram has not confirmed delivery yet
-
-            b._last_assistant_text = lambda: "[tg] the reply already queued"
-            b._last_backstop_key = "queued-key"  # same text, same key — this IS what was sent
-            b._drain_transcript = lambda: None
-
-            b._finish_turn()
-
-            self.assertEqual(b.tg.sent, [],
-                             "a reply already queued by this turn was forwarded a second time")
-
     def test_terminal_originated_turn_is_never_late_final_forwarded(self):
         """A turn that did not come from Telegram must stay silent, exactly like the original
         backstop — the late-final check is not a new leak for local turns."""
@@ -322,6 +304,217 @@ class LateFinalAnswerRealTranscriptAndReaderTests(unittest.TestCase):
                 "the turn's real final answer, appended to the transcript after the interim "
                 "drain, must arrive — exactly once",
             )
+
+            # "Exactly once" was only half measured above: the docstring promised it but nothing
+            # here actually drained AGAIN afterwards to check for a re-send. A later drain (the
+            # outbound loop keeps calling it after the turn is over) must not touch anything —
+            # `_unsent_final_text()` already moved `_tpos` past both records.
+            b._drain_transcript()
+            self.assertEqual(
+                b.tg.sent,
+                ["working on it...", "done — here is the final answer"],
+                "a drain after _finish_turn() re-sent the turn's final answer",
+            )
+
+
+class LateFinalCheckDrainsBeforeScanningTests(unittest.TestCase):
+    """c51dfe4: `_unsent_final_text()` now drains FIRST on every attempt, before it tail-scans.
+    The old scan-only version returned just the transcript's LAST assistant text — so when TWO
+    texts landed after the last drain, the first of them was silently dropped, the very shape of
+    T-0404 one message further along. Draining first lets the normal per-record path forward every
+    complete record it finds, oldest first, and moves `_tpos` past them, so a later drain cannot
+    resend anything. Real transcript file, real `ClaudeCodeReader`, no stubs, no threads."""
+
+    def test_two_texts_written_after_the_last_drain_arrive_in_order_exactly_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _regrese_bridge(d)
+            transcript = Path(d) / "transcript.jsonl"
+            b._transcript = transcript
+            b._tpos = 0
+            b._tg_since = 0
+            b._turn_active.set()
+            b._turn_from_tg = False
+            b._turn_text_sent = False
+
+            _write_transcript(transcript, [
+                _user_record("[TG] status please"),
+                _assistant_record("[tg] pracuju na tom"),
+            ])
+            b._drain_transcript()
+            self.assertEqual(b.tg.sent, ["pracuju na tom"],
+                             "test setup is wrong: the interim text should have forwarded")
+
+            # TWO final texts land after that drain already ran — the old scan-only code returned
+            # only the LAST of these and silently dropped the first.
+            _append_transcript(transcript, [
+                _assistant_record("[tg] cast PRVNI"),
+                _assistant_record("[tg] cast DRUHA"),
+            ])
+
+            b._finish_turn()
+
+            self.assertEqual(
+                b.tg.sent, ["pracuju na tom", "cast PRVNI", "cast DRUHA"],
+                "both parts written after the last drain must arrive, in order",
+            )
+
+            # Nothing must be sent twice: a further drain (the outbound loop keeps calling it)
+            # must find the cursor already past both records.
+            b._drain_transcript()
+            self.assertEqual(
+                b.tg.sent, ["pracuju na tom", "cast PRVNI", "cast DRUHA"],
+                "a drain after _finish_turn() re-sent one of the late final texts",
+            )
+
+
+class LateFinalCheckReaderMemoryIsPreservedTests(unittest.TestCase):
+    """c51dfe4: the tail scan inside `_last_assistant_text()` now runs the reader's `parse()`
+    under `_reader_unchanged()`. `CodexReader` keeps a bounded `deque` of the last few message
+    hashes so an old Codex build's duplicate log line is not forwarded twice; re-feeding already-
+    drained records into that window (as a plain, unguarded re-scan would) shifts it and can make
+    the reader mistake the NEXT real reply for a duplicate and silently drop it. The scan is a
+    read-only question and must leave that memory exactly as it found it."""
+
+    def test_recent_msgs_deque_is_byte_for_byte_unchanged_after_the_scan(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._reader = readers.for_agent("codex")
+            records = [
+                {"type": "response_item", "timestamp": "t1",
+                 "payload": {"type": "message", "role": "assistant",
+                             "content": [{"type": "output_text", "text": "[tg] first reply"}]}},
+                {"type": "response_item", "timestamp": "t2",
+                 "payload": {"type": "message", "role": "assistant",
+                             "content": [{"type": "output_text", "text": "[tg] second reply"}]}},
+            ]
+            b._transcript.write_text(
+                "\n".join(json.dumps(r) for r in records) + "\n", "utf-8")
+
+            before_msgs = list(b._reader._recent_msgs)
+            before_users = list(b._reader._recent_users)
+
+            text = b._last_assistant_text()
+
+            self.assertEqual(text, "[tg] second reply",
+                             "test setup is wrong: the scan should have found the last reply")
+            self.assertEqual(list(b._reader._recent_msgs), before_msgs,
+                             "the read-only tail scan shifted the reader's live dedup memory "
+                             "(_recent_msgs)")
+            self.assertEqual(list(b._reader._recent_users), before_users,
+                             "the read-only tail scan shifted the reader's live dedup memory "
+                             "(_recent_users)")
+
+
+class LateFinalCheckLogsWhenNothingToSendTests(unittest.TestCase):
+    """c51dfe4: when the late-final check finds nothing new to forward, it must say so — a quiet
+    outcome that looks exactly like a broken one is how T-0404 stayed invisible for a day."""
+
+    def setUp(self):
+        self._retry_delay = attach_mod.BACKSTOP_RETRY_DELAY
+        attach_mod.BACKSTOP_RETRY_DELAY = 0.0
+
+    def tearDown(self):
+        attach_mod.BACKSTOP_RETRY_DELAY = self._retry_delay
+
+    def test_logs_a_line_when_the_transcripts_last_text_was_already_forwarded(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _regrese_bridge(d)
+            transcript = Path(d) / "transcript.jsonl"
+            b._transcript = transcript
+            b._tpos = 0
+            b._tg_since = 0
+            b._turn_active.set()
+            b._turn_from_tg = False
+            b._turn_text_sent = False
+
+            _write_transcript(transcript, [
+                _user_record("[TG] status please"),
+                _assistant_record("[tg] the only reply this turn sent"),
+            ])
+            b._drain_transcript()
+            self.assertEqual(b.tg.sent, ["the only reply this turn sent"],
+                             "test setup is wrong: the interim text should have forwarded")
+
+            with self.assertLogs("agent2telegram.attach", level="INFO") as logs:
+                b._finish_turn()
+
+            self.assertEqual(b.tg.sent, ["the only reply this turn sent"],
+                             "nothing new should have been sent")
+            self.assertTrue(
+                any("TURN END late final: nothing left to send" in line for line in logs.output),
+                "the quiet branch must log that it found nothing, not stay silent",
+            )
+
+
+class LateFinalCheckRequiresATranscriptTests(unittest.TestCase):
+    """c51dfe4: the late-final branch now gates on `self._transcript is not None`, not on
+    `_has_turn_end_backstop_source()` (transcript OR signal file). A bridge configured with only a
+    signal file has nothing this check can read — it must not run at all, and must not crash."""
+
+    def test_no_transcript_configured_the_check_does_not_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _bridge(d)
+            b._transcript = None
+            b._signal.write_text("[tg] stale signal text", "utf-8")
+            b._turn_text_sent = True
+            b._turn_sent_keys = {"interim-key"}
+            b.tg.sent.append((7, "interim reply"))
+
+            def unexpected_scan(*a, **k):
+                raise AssertionError("the late-final check ran with no transcript configured")
+
+            b._unsent_final_text = unexpected_scan
+
+            b._finish_turn()                     # must not raise
+
+            self.assertEqual(b.tg.sent, [(7, "interim reply")],
+                             "a configuration with only a signal file must not be read by the "
+                             "late-final check")
+            self.assertFalse(b._turn_active.is_set())
+
+
+class DurableOutboxRepliesAreNotResentByTheLateFinalCheckTests(unittest.TestCase):
+    """Replaces test_final_answer_already_queued_to_the_durable_outbox_is_not_sent_twice, which
+    had "durable outbox" in its name but ran with `_use_durable_outbox=False` and hand-set
+    `_turn_sent_keys` itself — it never touched a real outbox, so the name was a lie about what it
+    measured. This one turns the durable outbox ON and drives a REAL `DurableOutbox`: the interim
+    reply is genuinely enqueued to disk and NOT yet confirmed by Telegram (`_sent_keys` stays
+    empty), and the late-final check at turn end must recognise it as already forwarded — from
+    `_turn_sent_keys`/the real outbox record — and not resend it."""
+
+    def test_reply_genuinely_enqueued_to_the_durable_outbox_is_not_resent(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _regrese_bridge(d)
+            b._use_durable_outbox = True          # the thing the old test's name promised
+            transcript = Path(d) / "transcript.jsonl"
+            b._transcript = transcript
+            b._tpos = 0
+            b._tg_since = 0
+            b._turn_active.set()
+            b._turn_from_tg = False
+            b._turn_text_sent = False
+
+            _write_transcript(transcript, [
+                _user_record("[TG] status please"),
+                _assistant_record("[tg] queued reply"),
+            ])
+            b._drain_transcript()
+
+            # Proof this measures a real outbox, not a stub: a real record sits on disk, and
+            # Telegram has not confirmed it yet — only the outbound consumer may do that.
+            queued = b._ensure_outbox().head()
+            self.assertIsNotNone(queued, "the interim reply was never enqueued to the outbox")
+            self.assertEqual(b.tg.sent, [], "the outbox consumer, not the producer, must send")
+            self.assertTrue(b._turn_text_sent)
+
+            b._finish_turn()
+
+            self.assertEqual(b.tg.sent, [],
+                             "a reply already sitting in the durable outbox was forwarded again "
+                             "by the late-final check")
+            still_queued = b._ensure_outbox().head()
+            self.assertIsNotNone(still_queued,
+                                 "the late-final check must not touch a record it did not send")
 
 
 class ReactionTurnBackstopTests(unittest.TestCase):
