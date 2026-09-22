@@ -1756,23 +1756,41 @@ class AttachBridge:
             return None
         last = None
         last_key = None                              # transcript with no assistant text at all
-        for raw in tail.split(b"\n"):
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line.decode("utf-8", "ignore"))
-            except (ValueError, json.JSONDecodeError):
-                continue
-            try:
-                for ev in self._reader.parse(rec):
-                    if ev.kind == "text" and ev.text and ev.text.strip():
-                        last = ev.text
-                        last_key = ev.key            # dedup id of that very message
-            except Exception:
-                continue
+        with self._reader_unchanged():
+            for raw in tail.split(b"\n"):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8", "ignore"))
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                try:
+                    for ev in self._reader.parse(rec):
+                        if ev.kind == "text" and ev.text and ev.text.strip():
+                            last = ev.text
+                            last_key = ev.key        # dedup id of that very message
+                except Exception:
+                    continue
         self._last_backstop_key = last_key
         return last
+
+    @contextmanager
+    def _reader_unchanged(self):
+        """Run a READ-ONLY re-read without moving the reader's memory. Readers are stateful:
+        CodexReader keeps a window of the last 8 message hashes so a Codex <= 0.144 double-log is
+        not sent twice. A tail scan re-reads records the drain already consumed, and feeding them
+        into that window shifts it — which decides whether the NEXT real message is taken for a
+        duplicate and dropped. The scan is a question, and a question must not change the answer."""
+        reader = getattr(self, "_reader", None)
+        saved = [(d, list(d)) for d in vars(reader).values()
+                 if isinstance(d, deque)] if reader is not None else []
+        try:
+            yield
+        finally:
+            for d, items in saved:
+                d.clear()
+                d.extend(items)
 
     def _wait_backstop_retry(self) -> None:
         stop = getattr(self, "_stop", None)
@@ -1819,30 +1837,44 @@ class AttachBridge:
             self._turn_sent_keys = keys
         keys.add(key)
 
-    def _turn_forwarded(self, key: str | None) -> bool:
+    def _turn_forwarded(self, key: str | None, forwarded: "set | None" = None) -> bool:
         """Has this message already been handed to the delivery path? `_turn_sent_keys` covers
         this turn (including replies still sitting in the durable outbox), `_sent_keys` covers
-        everything Telegram has already confirmed, in this turn or an earlier one."""
+        everything Telegram has already confirmed, in this turn or an earlier one. `forwarded` is
+        the snapshot taken when the turn ended: a turn that STARTS while this check waits empties
+        the live set, and without the snapshot this turn's own last reply would look unsent and go
+        out a second time (same race the `_turn_seq` guard below exists for)."""
         if not key:
             return False
-        return (key in getattr(self, "_turn_sent_keys", ())
+        return (key in (forwarded or ())
+                or key in getattr(self, "_turn_sent_keys", ())
                 or key in getattr(self, "_sent_keys", ()))
 
-    def _unsent_final_text(self) -> tuple[str | None, str | None]:
+    def _unsent_final_text(self, forwarded: set) -> tuple[str | None, str | None]:
         """(text, key) of the transcript's last assistant message when this turn has NOT forwarded
         it, else (None, None).
 
-        Why it re-scans: the final text and the end of the turn land in the same second, so at the
-        first look the transcript can still end with the interim message that WAS forwarded.
-        Between attempts we drain — if the line is complete by then, the normal path sends it and
-        its key reads as forwarded, which is the good outcome and ends the loop."""
+        Every attempt DRAINS FIRST, and that is what keeps the order and the count right: the
+        drain forwards every COMPLETE record the normal way — all of them, oldest first, and it
+        moves the cursor past them. The tail scan then only has to catch what a drain cannot see,
+        a record still being written. Scanning without draining would deliver the LAST text and
+        silently drop anything written before it, and would leave `_tpos` behind that record, so a
+        later drain would send it a second time.
+
+        Why it re-scans at all: the final text and the end of the turn land in the same second, so
+        the first look can still hit the file mid-write."""
         for attempt in range(LATE_FINAL_RETRY_ATTEMPTS):
+            try:
+                self._drain_transcript()
+            except Exception as e:
+                log.debug("turn-end final check: transcript drain failed: %s", e)
             text = self._last_assistant_text()
             key = getattr(self, "_last_backstop_key", None)
-            if text and text.strip() and not self._turn_forwarded(key):
+            if text and text.strip() and not self._turn_forwarded(key, forwarded):
                 if not key:
-                    # Without a dedup id the normal path could send the same text again; a
-                    # duplicate reply is bad but silence is worse, so SAY it happened.
+                    # Today unreachable: both readers always produce a key (a uuid, or a hash of
+                    # the text). It is here for the reader that stops doing so — and it SAYS so,
+                    # because this whole check exists against silent drops.
                     log.warning("turn-end final check: the last transcript text has no dedup id, "
                                 "not forwarding %r", text[:30])
                     return None, None
@@ -1852,15 +1884,10 @@ class AttachBridge:
             # parses as nothing). With everything drained there is nothing in flight, and an
             # unconditional wait would put its delay on the end of EVERY answered turn, which
             # blocks the outbound loop and with it the next turn's forwarding.
-            if (attempt != LATE_FINAL_RETRY_ATTEMPTS - 1
-                    and self._transcript_size() > getattr(self, "_tpos", 0)):
-                self._wait_backstop_retry()
-                try:
-                    self._drain_transcript()
-                except Exception as e:
-                    log.debug("turn-end final check: transcript drain failed: %s", e)
-            else:
+            if (attempt == LATE_FINAL_RETRY_ATTEMPTS - 1
+                    or self._transcript_size() <= getattr(self, "_tpos", 0)):
                 break
+            self._wait_backstop_retry()
         return None, None
 
     def _has_turn_end_backstop_source(self) -> bool:
@@ -1931,7 +1958,7 @@ class AttachBridge:
                 and not getattr(self, "_turn_is_reaction", False)
                 and self._owner_chat is not None
                 and getattr(self, "_turn_end_backstop_enabled", True)
-                and self._has_turn_end_backstop_source()):
+                and getattr(self, "_transcript", None) is not None):
             # The turn DID forward something — and that is exactly how its LAST message got lost.
             # `_turn_text_sent` says "something went out", not "the answer went out": measured on
             # 2026-09-21 22:36 and 2026-09-22 19:12:30, an interim message was delivered, the final
@@ -1942,12 +1969,18 @@ class AttachBridge:
             # transcript with what this turn actually sent and deliver the difference. WITH its
             # dedup key — without it the normal path and this one send the same text twice
             # (proven 2026-08-02).
-            text, key = self._unsent_final_text()
+            forwarded = set(getattr(self, "_turn_sent_keys", ()) or ())
+            text, key = self._unsent_final_text(forwarded)
             out = self._strip_marker(text) if text else ""
             if out and key:
                 self._send_final(out, key=key)
                 log.info("TURN END late final → forwarded the turn's last text key=%s %r",
                          key, out[:30])
+            else:
+                # Says what the check FOUND, not that it ran: a turn-end check whose quiet
+                # outcome looks exactly like a broken one is how T-0404 stayed invisible for a day.
+                log.info("TURN END late final: nothing left to send (last transcript key=%s)",
+                         getattr(self, "_last_backstop_key", None))
         self._turn_active.clear()
         # A turn's Telegram origin DIES WITH AN ENDED TURN. Leaving it raised was not cosmetic: a
         # message typed into the tmux pane while a turn is finishing gets QUEUED by Claude Code
