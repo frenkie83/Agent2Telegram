@@ -17,12 +17,17 @@ It reads the signal path / optional session guard from the Agent2Telegram config
 line needs no arguments. Always exits 0 (never blocks the agent).
 
 Because it is registered **once globally**, the hook runs at the end of every turn of *every*
-Claude Code session on the machine — most of which no bridge is watching. So it never guesses
-from the config alone: each bridge publishes the transcript it currently tails next to its
-marker (``<state>/transcript``), and only the bridge whose published transcript is the one in
-the payload gets marked. Guessing (session guard, then guard-less configs) is left only for
-bridges that published nothing, e.g. an older build. Before that, one session's turn end marked
-every bridge and closed Telegram turns that were still being written (22. 10. 2026).
+Claude Code session on the machine — including sessions no bridge is watching, and including
+one-shot ``claude -p`` runs from scripts. So it never guesses from the config alone: each bridge
+publishes the transcript it currently tails next to its marker (``<state>/transcript``), and
+only the bridge whose published transcript is **exactly** the payload's gets marked. The
+published transcript takes precedence over the session guard; the guard (and then the
+guard-less fallback) is left only for configs that publish no such file at all, e.g. an older
+build. An empty published file means "this bridge publishes, nothing resolved yet" and is never
+marked.
+
+Before that, a turn end from a session whose config carried no guard marked *every* guard-less
+config, so it closed Telegram turns of other bridges that were still being written (22. 10. 2026).
 """
 from __future__ import annotations
 
@@ -30,6 +35,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 
@@ -68,36 +74,49 @@ def _mark(signal: str) -> None:
         pass
 
 
-def _published(signal: str) -> str:
+def _published(signal: str) -> str | None:
     """The transcript a bridge says it is tailing — written by AttachBridge._publish_transcript.
-    ``""`` when it published none (no file, empty, unreadable)."""
+
+    Three outcomes, and the difference between the last two decides the routing: a path, ``""``
+    for "this bridge publishes but has nothing resolved yet", and ``None`` for "no such file", the
+    only case where the hook may still guess. An existing-but-unreadable file counts as
+    publishing — a bridge we cannot read is not a bridge we may guess about."""
+    p = Path(signal).parent / "transcript"
     try:
-        return (Path(signal).parent / "transcript").read_text("utf-8").strip()
+        if not p.exists():
+            return None
+        return p.read_text("utf-8").strip()
     except Exception:
         return ""
 
 
 def _select_configs(cfgs: list[dict], transcript_path: str) -> list[dict]:
     """The bridges this turn end belongs to. Pure: each config carries its published transcript
-    under ``_published`` (filled in by main via :func:`_published`), nothing is read here."""
-    want = os.path.realpath(transcript_path)
-    publishers = [(c, os.path.realpath((c["_published"] or "").strip()))
-                  for c in cfgs if (c.get("_published") or "").strip()]
+    under ``_published`` (filled in by main via :func:`_published`), nothing is read here.
 
-    exact = [c for c, tr in publishers if tr == want]
+    A publishing bridge is marked ONLY on an exact path match. Matching the project directory
+    instead was tried and dropped: `claude -p` runs from scripts (``zeptej-se-lenky``,
+    ``lenka-katalog-api``, ``ai-novinky``) and two overlapping sessions in one cwd all produce
+    turn ends in a directory a bridge is tailing — the original bug with one more step."""
+    want = os.path.realpath(transcript_path)
+    exact = []
+    for c in cfgs:
+        pub = (c.get("_published") or "").strip()
+        if not pub:
+            continue                 # no file, or nothing resolved yet → not matchable here
+        try:
+            if os.path.realpath(pub) == want:
+                exact.append(c)
+        except ValueError:
+            continue                 # NUL byte etc. in one config must not break routing for all
     if exact:
         return exact
-    # Claude starts a new transcript per session, and a bridge can still be on the previous one
-    # for a few seconds after a session swap. Same project dir = same cwd = our session anyway.
-    same_dir = [c for c, tr in publishers
-                if os.path.dirname(tr) == os.path.dirname(want)]
-    if same_dir:
-        return same_dir
 
-    # A bridge that published a DIFFERENT transcript is definitely not ours — only the ones that
-    # published nothing are still guessed at. A config with a session guard fires only for ITS
-    # session; if none matched, fall back to the guard-less ones (old behaviour preserved).
-    rest = [c for c in cfgs if not (c.get("_published") or "").strip()]
+    # A bridge that published anything (even an empty file — "nothing resolved yet") is never
+    # guessed at: it says which transcript is its own, and this is not it. Only configs with no
+    # published file at all fall back to the old guess — a config with a session guard fires only
+    # for ITS session, and if none matches, every guard-less config does.
+    rest = [c for c in cfgs if c.get("_published") is None]
     base = os.path.basename(transcript_path)
     guarded = [c for c in rest
                if c.get("claude_session_id") and base.startswith(c["claude_session_id"])]
@@ -130,5 +149,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except Exception:
+        # Exit code stays 0 (a hook must never block the agent), but a hook that routes turn ends
+        # must not fail silently either — stderr lands in Claude Code's hook output.
+        traceback.print_exc(file=sys.stderr)
     finally:
         sys.exit(0)
