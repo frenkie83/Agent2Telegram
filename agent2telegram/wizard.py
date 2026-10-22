@@ -295,8 +295,8 @@ def _session_cwd(session: str) -> str | None:
 
 def _claude_session_id_for(session: str) -> str:
     """The Claude session UUID running in *session*, resolved from ~/.claude/projects/ by the
-    session's working directory — used as the Stop-hook guard so multiple Claude bridges each get
-    turn-end signals for their own session only."""
+    session's working directory — the Stop hook's *fallback* guard. The hook normally routes by the
+    transcript each running bridge publishes; the guard only helps a bridge that published none."""
     import glob
     import os
     import re
@@ -431,8 +431,8 @@ def connect(name: str | None = None) -> int:
     elif agent_cls.name == "claude-code":
         _register_claude_hook()
         if not cfg.claude_session_id:
-            print("  ⚠️  Couldn't pin this session's id yet (talk to the agent once, then it'll "
-                  "route turn-end signals precisely). It still works meanwhile.")
+            print("  ⚠️  Couldn't pin this session's id yet — it only matters before the bridge "
+                  "starts; once running, turn-end signals route by the transcript it publishes.")
 
     if not cfg.allowed_user_ids:
         print("⚠️  No authorized user — add your id to 'allowed_user_ids' before using the bot.")

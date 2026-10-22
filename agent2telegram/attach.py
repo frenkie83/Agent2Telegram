@@ -284,7 +284,9 @@ class AttachBridge:
         self._signal = Path(cfg.signal_file) if cfg.signal_file else None
         # Claude Code only: end-of-turn marker its Stop hook writes (keeps "typing…" lit through
         # long thinking and off exactly at turn end). Codex needs none — its rollout records
-        # task_complete, so the reader signals turn end directly.
+        # task_complete, so the reader signals turn end directly. The hook is registered once
+        # globally, so it runs for EVERY Claude session on the machine; it decides whose marker to
+        # write from the transcript each bridge publishes (see _publish_transcript).
         self._turn_end = (self._signal.parent / "turn_end") if self._signal else None
         # Outbound-loop heartbeat: touched at the end of every forward cycle (see _outbound_loop).
         # The process and the inbound poller can stay alive while forwarding is wedged — a blocking
@@ -296,6 +298,7 @@ class AttachBridge:
         # Codex writes a fresh rollout-*.jsonl per session under ~/.codex/sessions; auto-detect
         # the newest one (and re-detect if the session restarts). Claude Code uses a fixed path.
         self._transcript = self._resolve_transcript()
+        self._publish_transcript()
         self._last_resolve = 0.0
         expected_agent_commands = _expected_agent_commands(cfg)
         self._session = TmuxSession([], name=cfg.tmux_session, cwd=Path.home(),
@@ -482,9 +485,32 @@ class AttachBridge:
             return
         log.info("transcript → %s", newest.name)
         self._transcript = newest
+        self._publish_transcript()     # the global Stop hook must follow us to the new file
         self._tpos = 0
         self._tg_since = 0             # offsets do not carry across to a different file
         self._resume_position()
+
+    def _publish_transcript(self) -> None:
+        """Publish the transcript we tail, next to the turn_end marker, for the Stop hook.
+
+        Claude Code's Stop hook is registered once globally, so it fires at the end of EVERY
+        session's turn and only learns which transcript that was from its payload. Without this
+        file it had to guess whose bridge to mark: a foreign session's turn end closed every
+        bridge's Telegram turn (22. 10., the assistant coordinator's answer was never forwarded).
+        Best-effort — a bridge that cannot publish just falls back to the hook's old guessing."""
+        if self._signal is None:
+            return
+        published = self._signal.parent / "transcript"
+        try:
+            if self._transcript is None:
+                published.unlink(missing_ok=True)
+                return
+            published.parent.mkdir(parents=True, exist_ok=True)
+            tmp = published.parent / (published.name + ".tmp")
+            tmp.write_text(str(self._transcript), encoding="utf-8")
+            tmp.replace(published)                   # atomic — the hook may read it any moment
+        except OSError as e:
+            log.warning("could not publish tailed transcript: %s", e)
 
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
