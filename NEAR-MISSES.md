@@ -449,3 +449,42 @@ difference with its dedup key. It asks about the consequence, not the state.
 
 **The rule worth keeping:** every flag that guards a delivery has to be read as what it literally
 records. `text_sent=True` proves a message was sent. It never proved that *this* message was.
+
+---
+
+## 2026-10-22 · A foreign session's turn end closed somebody else's Telegram turn
+
+**What happened:** at 10:52:33 a Claude session ended a turn — the craftsmen project's
+coordinator, whose bridge config carries no session guard. Fourteen seconds later, at 10:52:47,
+the **assistant coordinator's** bridge closed its own Telegram turn through the backstop with
+`text_sent=False`: it had sent nothing and had nothing to rescue, because its agent was still
+thinking. Its answer was written at 10:55:51, three minutes after the turn it belonged to had
+been declared over, and was never forwarded. The user got silence from a session that had
+answered. (Finding in `ops`: T-0732.)
+
+**Why it slipped through:** the Stop hook is registered **once globally** in
+`~/.claude/settings.json`, so it runs at the end of every turn of every Claude session on the
+machine. It decided whose marker to write from the configs: those whose `claude_session_id`
+prefixes the payload's transcript filename and — only if none matched — *every* config without
+such a guard. Guards do exist (`config.json` for the supervisor, `lenka.json`, and
+`most-prepni-sezeni` rewrites the supervisor's at every session swap), and that is exactly why
+the mechanism looked sound from the guarded side: when the supervisor's own turn ended, its guard
+matched, `matched` went True, and the guard-less bridges were never reached. The damage came from
+the other direction — a turn end from a session that *has* no guard matches nothing, and the
+fallback then marks every guard-less bridge, however unrelated. "I don't know whose turn this
+was" was implemented as "everybody's". Each bridge's tests were green: with one bridge, marking
+everybody is also correct.
+
+**What changed:** the bridge publishes the transcript it tails (`<state>/transcript`, written
+under the instance lock at startup and on every re-resolve), and the hook marks only the bridge
+whose published transcript is **exactly** the payload's. The published file takes precedence over
+the guard, and the guard now serves only configs that publish no such file at all; an empty file
+means "publishes, nothing of mine resolved yet" and is never marked. Matching the project
+*directory* instead of the exact path was written first and dropped before deployment — `claude
+-p` runs from scripts and two sessions sharing one cwd would have reproduced the same bug one
+step further out. Closing the Claude marker path non-definitively for implausibly fast turns was
+tried as a second net and dropped as well: a non-definitive end deliberately leaves the Telegram
+origin raised, so a legitimate short answer (under three seconds) would have kept the origin open
+and the next purely LOCAL answer in the pane could have leaked into the chat — the failure
+`_finish_turn` guards against, re-opened from the other side. Routing is the fix; the marker stays
+authoritative. The hook asks "whose turn ended", not "who could be interested".

@@ -284,7 +284,9 @@ class AttachBridge:
         self._signal = Path(cfg.signal_file) if cfg.signal_file else None
         # Claude Code only: end-of-turn marker its Stop hook writes (keeps "typing…" lit through
         # long thinking and off exactly at turn end). Codex needs none — its rollout records
-        # task_complete, so the reader signals turn end directly.
+        # task_complete, so the reader signals turn end directly. The hook is registered once
+        # globally, so it runs for EVERY Claude session on the machine; it decides whose marker to
+        # write from the transcript each bridge publishes (see _publish_transcript).
         self._turn_end = (self._signal.parent / "turn_end") if self._signal else None
         # Outbound-loop heartbeat: touched at the end of every forward cycle (see _outbound_loop).
         # The process and the inbound poller can stay alive while forwarding is wedged — a blocking
@@ -423,6 +425,10 @@ class AttachBridge:
     def _resolve_transcript(self) -> Path | None:
         """Resolve the transcript to tail. An explicit path is used as-is; ``""``/``"auto"``
         auto-detects the newest transcript for the agent (Codex rollout / Claude Code session)."""
+        # Cleared on every resolve; the auto-detection raises it when all it could do was pick the
+        # newest transcript across ALL projects (see _newest_claude). Such a guess must not be
+        # published to the Stop hook — it may well be another session's file.
+        self._transcript_best_effort = False
         tp = (self.cfg.transcript_path or "").strip()
         if tp and tp.lower() != "auto":
             p = Path(tp).expanduser()
@@ -446,7 +452,13 @@ class AttachBridge:
                 if d.is_dir():
                     dirs.append(d)
         if not dirs:
-            return self._newest_under(base) if not cwd else None
+            if cwd:
+                return None                   # cwd known but no project dir yet → wait
+            # cwd unknown → newest transcript across all projects, which may belong to a session
+            # that is not ours. Usable for tailing (best effort), but flagged so it is never
+            # published to the Stop hook as "this is my transcript".
+            self._transcript_best_effort = True
+            return self._newest_under(base)
         best, best_m = None, -1.0
         for d in dirs:
             p = self._newest_under(d, "*.jsonl")
@@ -472,6 +484,13 @@ class AttachBridge:
         self._last_resolve = now
         newest = self._resolve_transcript()
         if not newest or newest == self._transcript:
+            # Same file as before — but what we may PUBLISH about it can have changed: a bridge
+            # that started before its tmux cwd was readable published an empty file (a
+            # cross-project guess is not evidence), and the very next resolve, with the cwd
+            # known, confirms the same path. _publish_transcript writes only on change, so this
+            # is cheap; it has to run AFTER the resolve above, which recomputes the flag.
+            if newest:
+                self._publish_transcript()
             return
         # cwd-scoped resolution returns OUR session's own log, so follow it even mid-turn: a new
         # rollout for the same session means the current turn is being written THERE. Blocking the
@@ -482,9 +501,45 @@ class AttachBridge:
             return
         log.info("transcript → %s", newest.name)
         self._transcript = newest
+        self._publish_transcript()     # the global Stop hook must follow us to the new file
         self._tpos = 0
         self._tg_since = 0             # offsets do not carry across to a different file
         self._resume_position()
+
+    def _publish_transcript(self) -> None:
+        """Publish the transcript we tail, next to the turn_end marker, for the Stop hook.
+
+        Claude Code's Stop hook is registered once globally, so it fires at the end of EVERY
+        session's turn and only learns which transcript that was from its payload. Without this
+        file it had to guess whose bridge to mark, and a turn end from a session whose config
+        carried no guard marked every guard-less bridge (22. 10., the assistant coordinator's
+        answer was never forwarded).
+
+        The file is written, never removed: its existence means "this bridge routes by path, do
+        not guess about me". With no transcript resolved yet — or only a cross-project guess, which
+        may be another session's file — the content is EMPTY, which the hook reads as "publishes,
+        nothing of mine yet" and never marks. Only a bridge that cannot write at all falls back to
+        the hook's old guessing.
+
+        Called on every re-resolve, so it writes only when the content actually changes (the
+        remembered value is updated after a successful write, never after a failed one)."""
+        if self._signal is None:
+            return
+        transcript = self._transcript
+        if getattr(self, "_transcript_best_effort", False):
+            transcript = None                        # a guess is not evidence of OUR session
+        body = os.path.realpath(transcript) if transcript is not None else ""
+        if body == getattr(self, "_published_value", None):
+            return
+        published = self._signal.parent / "transcript"
+        try:
+            published.parent.mkdir(parents=True, exist_ok=True)
+            tmp = published.parent / (published.name + ".tmp")
+            tmp.write_text(body, encoding="utf-8")
+            tmp.replace(published)                   # atomic — the hook may read it any moment
+            self._published_value = body
+        except OSError as e:
+            log.warning("could not publish tailed transcript: %s", e)
 
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
@@ -512,6 +567,11 @@ class AttachBridge:
             ) from None
 
     def _run_locked(self) -> None:
+        # Publishing happens UNDER the instance lock, not in __init__: a second instance over the
+        # same state dir would otherwise overwrite the running bridge's published transcript and
+        # only then die on AlreadyRunning — leaving the healthy bridge pointing at nothing while
+        # the global Stop hook routes turn ends by exactly that file.
+        self._publish_transcript()
         me = self.tg.get_me()
         log.info("Attach bridge live as @%s → tmux '%s', owner=%s",
                  me.get("username"), self.cfg.tmux_session, self._owner_chat)
