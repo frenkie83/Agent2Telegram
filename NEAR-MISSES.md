@@ -482,7 +482,9 @@ the guard, and the guard now serves only configs that publish no such file at al
 means "publishes, nothing of mine resolved yet" and is never marked. Matching the project
 *directory* instead of the exact path was written first and dropped before deployment — `claude
 -p` runs from scripts and two sessions sharing one cwd would have reproduced the same bug one
-step further out. As a second net, a turn ending within three seconds of its start now closes
-non-definitively on the Claude marker path too (the Codex signal path already did), so a marker
-that does slip through can no longer throw an answer away. The hook asks "whose turn ended", not
-"who could be interested".
+step further out. Closing the Claude marker path non-definitively for implausibly fast turns was
+tried as a second net and dropped as well: a non-definitive end deliberately leaves the Telegram
+origin raised, so a legitimate short answer (under three seconds) would have kept the origin open
+and the next purely LOCAL answer in the pane could have leaked into the chat — the failure
+`_finish_turn` guards against, re-opened from the other side. Routing is the fix; the marker stays
+authoritative. The hook asks "whose turn ended", not "who could be interested".

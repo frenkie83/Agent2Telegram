@@ -484,6 +484,13 @@ class AttachBridge:
         self._last_resolve = now
         newest = self._resolve_transcript()
         if not newest or newest == self._transcript:
+            # Same file as before — but what we may PUBLISH about it can have changed: a bridge
+            # that started before its tmux cwd was readable published an empty file (a
+            # cross-project guess is not evidence), and the very next resolve, with the cwd
+            # known, confirms the same path. _publish_transcript writes only on change, so this
+            # is cheap; it has to run AFTER the resolve above, which recomputes the flag.
+            if newest:
+                self._publish_transcript()
             return
         # cwd-scoped resolution returns OUR session's own log, so follow it even mid-turn: a new
         # rollout for the same session means the current turn is being written THERE. Blocking the
@@ -512,19 +519,25 @@ class AttachBridge:
         not guess about me". With no transcript resolved yet — or only a cross-project guess, which
         may be another session's file — the content is EMPTY, which the hook reads as "publishes,
         nothing of mine yet" and never marks. Only a bridge that cannot write at all falls back to
-        the hook's old guessing."""
+        the hook's old guessing.
+
+        Called on every re-resolve, so it writes only when the content actually changes (the
+        remembered value is updated after a successful write, never after a failed one)."""
         if self._signal is None:
             return
         transcript = self._transcript
         if getattr(self, "_transcript_best_effort", False):
             transcript = None                        # a guess is not evidence of OUR session
         body = os.path.realpath(transcript) if transcript is not None else ""
+        if body == getattr(self, "_published_value", None):
+            return
         published = self._signal.parent / "transcript"
         try:
             published.parent.mkdir(parents=True, exist_ok=True)
             tmp = published.parent / (published.name + ".tmp")
             tmp.write_text(body, encoding="utf-8")
             tmp.replace(published)                   # atomic — the hook may read it any moment
+            self._published_value = body
         except OSError as e:
             log.warning("could not publish tailed transcript: %s", e)
 
@@ -2119,23 +2132,6 @@ class AttachBridge:
         self._drain_transcript()
         self._finish_turn(definitive=definitive)
 
-    def _suspiciously_fast(self, zdroj: str) -> bool:
-        """Did this end-of-turn signal arrive implausibly soon after the turn began?
-
-        Both end signals can belong to somebody else: Codex's reader can read a stale
-        task_complete, and the Claude marker is written by a hook shared by every session on the
-        machine. Real work takes longer than SUSPICIOUS_TURN_SECONDS, so a faster end is closed
-        NON-definitively — the agent is still writing and its answer must still be forwarded."""
-        zacatek = getattr(self, "_turn_begun_at", 0.0)
-        if not zacatek:
-            return False
-        dur = time.monotonic() - zacatek
-        if dur >= SUSPICIOUS_TURN_SECONDS:
-            return False
-        log.warning("turn ending after %.1fs (%s) — suspiciously fast, a stale or foreign "
-                    "end-of-turn signal is the usual cause", dur, zdroj)
-        return True
-
 
     def _outbound_loop(self) -> None:
         while not self._stop.is_set():
@@ -2150,18 +2146,18 @@ class AttachBridge:
                 #     if turn_active is unset (e.g. a restart mid-turn that would orphan a bubble).
                 #   * Fallback: force-end if the transcript went quiet too long (hook missing).
                 if self._pending_turn_end:
-                    if self._suspiciously_fast("reader signal"):
+                    zacatek = getattr(self, "_turn_begun_at", 0.0)
+                    if zacatek and time.monotonic() - zacatek < SUSPICIOUS_TURN_SECONDS:
+                        log.warning("turn ending after %.1fs — suspiciously fast, a stale "
+                                    "end-of-turn signal is the usual cause",
+                                    time.monotonic() - zacatek)
                         # Already judged not to be this turn's real end, so it does not get to
                         # lower the Telegram origin either — the agent is still working.
                         self._finish_turn(definitive=False)
                     else:
                         self._finish_turn()
                 elif self._turn_end is not None and self._turn_end.exists():
-                    # Same judgement as above, and for a stronger reason: the marker comes from a
-                    # hook every session on the machine shares. Routing by the published
-                    # transcript keeps foreign markers out, but a bridge that cannot publish (or a
-                    # swap window) can still see one — then this is the net that keeps the answer.
-                    self._end_turn(definitive=not self._suspiciously_fast("Stop-hook marker"))
+                    self._end_turn()
                 elif self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
                     # This branch used to just close the turn: the backstop didn't run, so the
                     # reply wasn't sent and not even a log line was left. It was one of three ways
