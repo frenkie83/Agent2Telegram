@@ -35,12 +35,21 @@ class SelectConfigsTests(unittest.TestCase):
         result = stop_hook._select_configs([exact, same_dir_only], want)
         self.assertEqual(result, [exact])
 
-    def test_directory_match_used_when_no_exact_match(self):
-        """Right after a session swap the bridge may still show its previous transcript, but in
-        the same project directory as the new one — that is still close enough to mark."""
-        candidate = {"_published": "/state/dir/transcript-old.jsonl"}
-        result = stop_hook._select_configs([candidate], "/state/dir/transcript-new.jsonl")
-        self.assertEqual(result, [candidate])
+    def test_sibling_transcript_in_same_directory_is_not_marked(self):
+        """The directory-match branch was dropped in round 2: `claude -p` runs from scripts
+        (zeptej-se-lenky, lenka-katalog-api, ai-novinky) and two overlapping sessions in one cwd
+        all publish into the same project directory — matching on it was the original bug with
+        one more step. Only an exact realpath match may mark a publishing bridge."""
+        sibling = {"_published": "/state/dir/transcript-old.jsonl"}
+        result = stop_hook._select_configs([sibling], "/state/dir/transcript-new.jsonl")
+        self.assertEqual(result, [])
+
+    def test_empty_publication_is_never_marked_even_as_a_guess(self):
+        """An empty published file means 'this bridge routes by path, nothing resolved yet' — it
+        must never be marked, not even by falling back to the old guard-based guess."""
+        empty_publisher = {"_published": "", "claude_session_id": "abc123"}
+        result = stop_hook._select_configs([empty_publisher], "/x/abc123-session.jsonl")
+        self.assertEqual(result, [])
 
     def test_without_publishers_old_guess_behavior_is_preserved(self):
         """No bridge published anything (e.g. an older build): fall back to the session guard,
@@ -122,6 +131,26 @@ class MainIntegrationTests(unittest.TestCase):
         # _mark derives the marker path from signal_file, not from any other config field.
         self.assertEqual(marker_a, Path(signal_a).parent / "turn_end")
 
+    def test_corrupted_transcript_file_does_not_crash_and_others_route_correctly(self):
+        """A `transcript` file with an embedded NUL (e.g. a write caught mid-flush) must not
+        break routing for every bridge — main() must still exit cleanly and still mark the
+        bridge whose published transcript is intact and matches the payload."""
+        signal_broken = self.root / "broken" / "signal"
+        signal_ok = self.root / "ok" / "signal"
+        self._write_cfg("broken.json", signal_broken)
+        self._write_cfg("ok.json", signal_ok)
+        transcript_x = str(self.root / "sessions" / "x.jsonl")
+        signal_broken.parent.mkdir(parents=True)
+        signal_ok.parent.mkdir(parents=True)
+        (signal_broken.parent / "transcript").write_bytes(b"/some\x00path.jsonl")
+        (signal_ok.parent / "transcript").write_text(transcript_x, "utf-8")
+
+        sys.stdin = io.StringIO(json.dumps({"transcript_path": transcript_x}))
+        stop_hook.main()  # must not raise
+
+        self.assertTrue((signal_ok.parent / "turn_end").exists())
+        self.assertFalse((signal_broken.parent / "turn_end").exists())
+
 
 class PublishTranscriptTests(unittest.TestCase):
     """Tests for AttachBridge._publish_transcript, built without full __init__ (tmux/transcript
@@ -144,11 +173,13 @@ class PublishTranscriptTests(unittest.TestCase):
         self.assertTrue(published.exists())
         content = published.read_text("utf-8")
         self.assertTrue(os.path.isabs(content))
-        self.assertEqual(content, str(b._transcript))
+        self.assertEqual(content, os.path.realpath(b._transcript))
 
-    def test_deletes_published_file_when_transcript_is_none(self):
-        """No transcript resolved yet (e.g. right after a session restart) must not leave a stale
-        published path behind for the hook to misroute against."""
+    def test_writes_empty_file_when_transcript_is_none(self):
+        """No transcript resolved yet (e.g. right after a session restart): the published file is
+        never removed (its mere existence means 'route by path, don't guess about me'), so it is
+        overwritten with an empty body instead — the hook reads that as 'nothing of mine yet' and
+        never marks this bridge, rather than falling back to guessing."""
         b = self._bridge()
         b._signal = self.root / "signal"
         published = self.root / "transcript"
@@ -156,7 +187,8 @@ class PublishTranscriptTests(unittest.TestCase):
         published.write_text("/stale/old.jsonl", "utf-8")
         b._transcript = None
         b._publish_transcript()
-        self.assertFalse(published.exists())
+        self.assertTrue(published.exists())
+        self.assertEqual(published.read_text("utf-8"), "")
 
     def test_noop_and_no_exception_without_a_signal_file(self):
         """A bridge configured with no signal_file (no Stop-hook wiring) must not try to publish
