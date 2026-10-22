@@ -449,3 +449,30 @@ difference with its dedup key. It asks about the consequence, not the state.
 
 **The rule worth keeping:** every flag that guards a delivery has to be read as what it literally
 records. `text_sent=True` proves a message was sent. It never proved that *this* message was.
+
+---
+
+## 2026-10-22 · A foreign session's turn end closed somebody else's Telegram turn
+
+**What happened:** the supervisor's Claude session finished a turn at 10:52:33. Fourteen seconds
+later, at 10:52:47, the **assistant coordinator's** bridge closed its own Telegram turn through
+the backstop with `text_sent=False` — it had sent nothing and had nothing to rescue, because its
+agent was still thinking. Its answer was written at 10:55:51, three minutes after the turn it
+belonged to had been declared over, and was never forwarded. The user got silence from a session
+that had answered. (Finding in `ops`: T-0732.)
+
+**Why it slipped through:** the Stop hook is registered **once globally** in
+`~/.claude/settings.json`, so it runs at the end of every turn of every Claude session on the
+machine. It decided whose marker to write from the config: a config whose `claude_session_id`
+prefixed the payload's transcript filename, and *otherwise every config without that guard*. The
+guard was written by the setup wizard from whatever session was running then, so after a session
+swap it is stale — and in practice no config had one at all. The fallback was therefore the only
+branch that ever ran, and "I don't know whose turn this was" was implemented as "everybody's".
+Each bridge's tests were green: one bridge is a case where marking everybody is also correct.
+
+**What changed:** the bridge now publishes the transcript it is tailing (`<state>/transcript`,
+written on start and on every re-resolve), and the hook marks only the bridge whose published
+transcript is the one in its payload — or, in the seconds after a session swap, one still tailing
+an older transcript in the same project directory. A bridge that published a **different**
+transcript is never marked. Guessing survives only for configs that published nothing, so an
+older build keeps working. The hook asks "whose turn ended", not "who could be interested".
