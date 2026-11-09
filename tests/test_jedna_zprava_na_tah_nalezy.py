@@ -65,9 +65,15 @@ class _Dead:
 
 
 class DruhaZpravaUprostredTahuTest(unittest.TestCase):
-    """Nalez 1: druha [TG] zprava uprostred tahu nesmi zahodit rozdelany text tahu."""
+    """Nalez 1: druha [TG] zprava uprostred tahu nesmi zahodit rozdelany text tahu.
 
-    def test_druha_zprava_uprostred_tahu_davku_nezahodi(self):
+    Puvodni tvar testu overoval jen to, ze se text objevil NEKDE v `tg.sent` — ne pocet vyskytu,
+    ne stav davky po jejim vyklopeni, ne co se stane po SKUTECNEM konci tahu. Scenar, ktery by tim
+    prolezl: prichod druhe zpravy text odesle, ale chybny reset ho necha i v `_batch` — po konci
+    tahu by ho `_finish_turn` vyklopil znovu a uzivatel by ho dostal podruhe. Test ted jde az za
+    konec tahu a pocita presne jeden vyskyt."""
+
+    def test_druha_zprava_uprostred_tahu_davku_nezahodi_a_nezdvoji(self):
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
             b._status_push = lambda *a, **k: None
@@ -85,10 +91,27 @@ class DruhaZpravaUprostredTahuTest(unittest.TestCase):
 
             b._handle(_msg(2, "[TG] a jeste Y"))
 
-            self.assertIn(
-                "zacinam na X", "\n".join(b.tg.sent),
-                "text rozdelaneho tahu se ztratil pri prichodu druhe zpravy",
+            self.assertEqual(
+                b.tg.sent, ["zacinam na X"],
+                "rozdelany text tahu se po prichodu druhe zpravy musi odeslat PRESNE jednou, "
+                f"hned: {b.tg.sent!r}",
             )
+            self.assertEqual(
+                list(getattr(b, "_batch", ()) or ()), [],
+                "po vyklopeni davky druhou zpravou nesmi `_batch` text drzet dal — "
+                "jinak ho konec tahu posle znovu",
+            )
+
+            _append_transcript(transcript, [_arec("[tg] dokoncuji", stop="end_turn", uuid="u2")])
+            b._drain_transcript()
+            b._finish_turn()
+
+            joined = "\n".join(b.tg.sent)
+            self.assertEqual(
+                joined.count("zacinam na X"), 1,
+                f"text uz jednou odeslany druhou zpravou se po konci tahu posel znovu: {b.tg.sent!r}",
+            )
+            self.assertIn("dokoncuji", joined, "zbytek tahu po druhe zprave se ztratil")
 
 
 class PodagentNezavreHlavniTahTest(unittest.TestCase):
@@ -138,15 +161,96 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
             self.assertIn("skutecna odpoved", "\n".join(b.tg.sent))
 
     def test_vysledek_nastroje_po_end_turn_zrusi_signal_konce(self):
-        """`continues_turn` rozhoduje jen podle TYPU zaznamu (je to vysledek nastroje?), ne podle
-        toho, jestli k nemu existuje nedoreseny tool_use — proto zadny `_toolrec` v setupu neni:
-        jeden by byl inertni (na vysledek testu by nemel vliv) a jen by predstiral parovani
-        volani/vysledku, ktere se tu nemeri.
+        """Co se tu meri: NEVYRIZENEHO volani (`task1` meli otevreny `tool_use`, zadny vysledek
+        jeste neprisel) ten FIRST tool_result po end_turn signal konce zrusit MUSI — jinak se tah
+        zavre, dokud agent na task1 jeste ceka, a skutecna odpoved se nikdy neprepose.
 
-        Puvodni tvar tohoto testu mel v setupu i `Task` zaznam a hlasku, ktera tvrdila presne to
-        parovani — bez dukazu. Co se mutaci overilo: zrusit `continues_turn` na vzdy `False`
-        nechava `_transcript_turn_end_ready()` po pozdnim vysledku nastroje `True` (misto spravne
-        `False`) — ready zustane `True -> True`, tah se zavre, dokud agent jeste pracuje."""
+        Predchozi tvar tohoto testu zamerne vynechaval parujici `Task` `tool_use`, protoze
+        `continues_turn` tehdy rozhodovala jen podle TYPU zaznamu a parovani vubec nemerila.
+        Po oprave produkce (`_answered_calls`) uz parovani existuje — FIRST vysledek nedoreseneho
+        volani rusi dal (tenhle test), DRUHY (duplicitni) vysledek TOHO SAMEHO volani uz nerusi
+        (`test_druhy_vysledek_jiz_vyrizeneho_volani_signal_konce_nerusi`, nize). `Task` zaznam v
+        setupu je proto zpatky — ted uz neni inertni."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _regrese_bridge(td)
+            b._status_push = lambda *a, **k: None
+            transcript = Path(td) / "t.jsonl"
+            b._transcript = transcript
+            b.cfg.turn_end_quiet_seconds = 0.05
+
+            b._handle(_msg(1, "[TG] zjisti neco"))
+            b._turn_begun_at -= 5
+
+            _write_transcript(transcript, [
+                _user_record("[TG] zjisti neco"),
+                _toolrec("task1", name="Task"),
+                _arec("[tg] hotovo", stop="end_turn", uuid="u1"),
+            ])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "end_turn hlavniho agenta bez pokracovani tah zavrit musi, i kdyz task1 "
+                "jeste nema vysledek",
+            )
+
+            _append_transcript(transcript, [_resultrec("task1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertFalse(
+                b._transcript_turn_end_ready(),
+                "prvni (zatim NEvyrizeny) vysledek task1 musi signal konce zrusit — agent na "
+                "nej jeste cekal, kdyz end_turn padl",
+            )
+
+    def test_druhy_vysledek_jiz_vyrizeneho_volani_signal_konce_nerusi(self):
+        """Oprava `8e1a7c0`: `continues_turn` si ted vede `_answered_calls` — id volani, na ktera
+        uz jednou videla vysledek. Opozdeny nebo znovu zalozeny DRUHY `tool_result` TEHOZ
+        `tool_use_id` uz nic nedokazuje (agent uz na nej odpoved mel, kdyz rekl `end_turn`), takze
+        signal konce nerusi — a tah se zavre na skutecne finalni odpovedi."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _regrese_bridge(td)
+            b._status_push = lambda *a, **k: None
+            transcript = Path(td) / "t.jsonl"
+            b._transcript = transcript
+            b.cfg.turn_end_quiet_seconds = 0.05
+
+            b._handle(_msg(1, "[TG] zjisti neco"))
+            b._turn_begun_at -= 5
+
+            _write_transcript(transcript, [
+                _user_record("[TG] zjisti neco"),
+                _toolrec("task1", name="Task"),
+                _resultrec("task1"),  # FIRST result — task1 je uz vyrizeny, nez tah vubec skonci
+            ])
+            b._drain_transcript()
+
+            _append_transcript(transcript, [_arec("[tg] hotovo", stop="end_turn", uuid="u1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "test setup is wrong: end_turn po jiz vyrizenem task1 musi signal vztycit",
+            )
+
+            # Opozdeny DRUHY vysledek stejneho volani (duplikat/znovu zalozeny zaznam).
+            _append_transcript(transcript, [_resultrec("task1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "druhy vysledek JIZ VYRIZENEHO volani zrusil platny signal konce — tah by visel "
+                "az do idle fallbacku a pozdejsi zprava by neprisla vcas",
+            )
+            b._end_turn()
+            self.assertIn("hotovo", "\n".join(b.tg.sent))
+
+    def test_vysledek_s_neznamym_id_signal_konce_rusi(self):
+        """Negativni protivaha k predchozimu testu: vysledek s ID, ktere tento reader NIKDY
+        nevidel (zadny parujici `tool_use`, zadny drivejsi vysledek), musi signal konce rusit dal
+        — to je bezpecny smer (`continues_turn`'s docstring: "the unknown id included"). Kdyby se
+        tahle vetev omylem zacala chovat jako u ZNAMEHO/vyrizeneho volani, tah by se zavrel
+        uprostred prace a skutecna odpoved by se nikdy neprepose."""
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
             b._status_push = lambda *a, **k: None
@@ -165,17 +269,16 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
             time.sleep(0.1)
             self.assertTrue(
                 b._transcript_turn_end_ready(),
-                "end_turn hlavniho agenta bez pokracovani tah zavrit musi",
+                "test setup is wrong: end_turn musi signal vztycit",
             )
 
-            _append_transcript(transcript, [_resultrec("task1")])
+            _append_transcript(transcript, [_resultrec("neznamy-id-nikdy-nevidany")])
             b._drain_transcript()
             time.sleep(0.1)
             self.assertFalse(
                 b._transcript_turn_end_ready(),
-                "vysledek nastroje prichazejici PO end_turn musi signal konce zrusit, i bez "
-                "parujiciho tool_use v teto transkripci — continues_turn se rozhoduje jen podle "
-                "typu zaznamu",
+                "vysledek s neznamym tool_use_id musi signal konce zrusit — bezpecny smer "
+                "('vsechno ostatni rusi dal, neznamy id vcetne') nesmi prestat platit",
             )
 
     def test_cela_posloupnost_task_sidechain_end_turn_tool_result_nezavre_hlavni_tah(self):
