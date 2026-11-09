@@ -488,3 +488,34 @@ origin raised, so a legitimate short answer (under three seconds) would have kep
 and the next purely LOCAL answer in the pane could have leaked into the chat — the failure
 `_finish_turn` guards against, re-opened from the other side. Routing is the fix; the marker stays
 authoritative. The hook asks "whose turn ended", not "who could be interested".
+
+---
+
+## 2026-11-09 · The turn end ran on a side effect, and the fix that removed it left no path at all
+
+**What happened:** on a bridge whose Claude session had been running since 2026-11-07, turns were
+never closed: Telegram kept showing "typing…" indefinitely. Measured with a probe in the Stop
+hook — that session logged six turn STARTS and not one natural turn END, i.e. the hook did not
+fire for it at all, while a session started the same day and two `claude -p` runs fired it every
+time, with the very switches the long-running session was started with. The second path, the
+`IDLE_DONE` idle fallback, cannot help here by construction: it measures **silence in the
+transcript**, and a session that is working is never silent.
+
+**Why it slipped through:** until 2026-10-22 turns were closed by a **side effect** of the old
+Stop-hook routing — the end of *any* foreign turn marked every config without a
+`claude_session_id` guard, so somebody else's turn end closed this bridge's turn often enough
+that nothing looked broken. That routing was a bug in its own right (see the 2026-10-22 entry)
+and was correctly removed. What nobody measured at the time was that for this bridge it had been
+the **only** path that ever fired. Removing a defect removed the mechanism as well, and the
+remaining "fallbacks" were a hook that does not run and a timer that waits for silence that never
+comes. Both looked like belts and braces on paper.
+
+**Damage:** none to the content — replies were delivered by the turn-end backstop. The turn
+itself never closed, so the typing indicator hung and the bridge held a turn open for days.
+
+**What catches it next time:** the bridge no longer depends on a signal it cannot verify. It ends
+a turn from the **transcript itself** — a positive statement about the last record (an assistant
+message whose `stop_reason` is `end_turn`, i.e. nothing pending), not the absence of further
+records (`AttachBridge._transcript_turn_end_ready`, T-0461). The rule worth keeping is the one
+this entry is really about: when a fix removes a behaviour, ask what was **living off** that
+behaviour. A path with three fallbacks of which two have never fired is a path with one.
