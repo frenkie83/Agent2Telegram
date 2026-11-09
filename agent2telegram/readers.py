@@ -124,6 +124,13 @@ class ClaudeCodeReader:
 
     _CALL_LIMIT = 4096
 
+    # ⛔ On the CLASS, not on the instance. `AttachBridge._reader_unchanged` protects reader state
+    # during a read-only tail scan by `deepcopy`ing `vars(reader)`, and a lock in there makes the
+    # whole snapshot fail — it only logs a warning, so the protection would silently stop working
+    # and the symptom would be a shifted dedup window, not a red test. Sharing one lock between
+    # reader instances costs nothing: it is held for a few dict operations and never nested.
+    _lock = threading.Lock()
+
     def __init__(self) -> None:
         # Tool calls seen in this stream: `_open_calls` = `tool_use` seen, result not yet;
         # `_closed_calls` = result already seen. Insertion-ordered, so the oldest is the one
@@ -131,7 +138,6 @@ class ClaudeCodeReader:
         # from the drain, which the bridge runs from more than one thread.
         self._open_calls: "dict[str, bool]" = {}
         self._closed_calls: "dict[str, bool]" = {}
-        self._lock = threading.Lock()
 
     def _trim(self, d: "dict[str, bool]") -> None:
         while len(d) > self._CALL_LIMIT:

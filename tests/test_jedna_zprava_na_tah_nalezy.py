@@ -161,16 +161,19 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
             self.assertIn("skutecna odpoved", "\n".join(b.tg.sent))
 
     def test_vysledek_nastroje_po_end_turn_zrusi_signal_konce(self):
-        """Co se tu meri: NEVYRIZENEHO volani (`task1` meli otevreny `tool_use`, zadny vysledek
-        jeste neprisel) ten FIRST tool_result po end_turn signal konce zrusit MUSI — jinak se tah
-        zavre, dokud agent na task1 jeste ceka, a skutecna odpoved se nikdy neprepose.
+        """Co se tu meri: OTEVRENEHO volani (`task1` ma v `_open_calls` zaznamenany `tool_use`,
+        zadny vysledek jeste neprisel) ten FIRST `tool_result` po end_turn signal konce zrusit
+        MUSI — jinak se tah zavre, dokud agent na task1 jeste ceka, a skutecna odpoved se nikdy
+        neprepose.
 
-        Predchozi tvar tohoto testu zamerne vynechaval parujici `Task` `tool_use`, protoze
-        `continues_turn` tehdy rozhodovala jen podle TYPU zaznamu a parovani vubec nemerila.
-        Po oprave produkce (`_answered_calls`) uz parovani existuje — FIRST vysledek nedoreseneho
-        volani rusi dal (tenhle test), DRUHY (duplicitni) vysledek TOHO SAMEHO volani uz nerusi
-        (`test_druhy_vysledek_jiz_vyrizeneho_volani_signal_konce_nerusi`, nize). `Task` zaznam v
-        setupu je proto zpatky — ted uz neni inertni."""
+        Reader (`agent2telegram/readers.py`, `ClaudeCodeReader.continues_turn`) rozhoduje podle
+        tri stavu: OTEVRENE (vyhrava, cancel), NEZNAME (cancel — most mohl pripojit uprostred
+        tahu), VSECHNA UZAVRENA (nerusi). Task se tu nejdriv OTEVRE (`_toolrec`) a pak dostane
+        svuj FIRST vysledek — presne ten stav, ktery musi cancelovat. DRUHY (duplicitni) vysledek
+        TEHOZ volani uz nerusi (`test_druhy_vysledek_jiz_vyrizeneho_volani_signal_konce_nerusi`,
+        nize), a REPLAY stejneho `tool_use`+`tool_result` po rewindu `_tpos` se chova jako prvni
+        pruchod (`test_replay_po_rewindu_tpos_se_nezavre_uprostred_prace`, nize — to je ten
+        blokujici nalez)."""
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
             b._status_push = lambda *a, **k: None
@@ -204,10 +207,16 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
             )
 
     def test_druhy_vysledek_jiz_vyrizeneho_volani_signal_konce_nerusi(self):
-        """Oprava `8e1a7c0`: `continues_turn` si ted vede `_answered_calls` — id volani, na ktera
-        uz jednou videla vysledek. Opozdeny nebo znovu zalozeny DRUHY `tool_result` TEHOZ
-        `tool_use_id` uz nic nedokazuje (agent uz na nej odpoved mel, kdyz rekl `end_turn`), takze
-        signal konce nerusi — a tah se zavre na skutecne finalni odpovedi."""
+        """`ClaudeCodeReader` (`agent2telegram/readers.py`) si vede dve mnoziny — `_open_calls`
+        (`tool_use` videno, vysledek jeste ne) a `_closed_calls` (vysledek uz viden). Oprava
+        `8e1a7c0` zavedla parovani, `11bd6a9` ho pak opravila na tri stavy (otevrene/nezname
+        vyhrava nad uzavrenym — viz `test_replay_po_rewindu_tpos_se_nezavre_uprostred_prace`),
+        ale tenhle smer (DRUHY vysledek jiz uzavreneho volani nerusi) zustal stejny: opozdeny
+        nebo znovu zalozeny DRUHY `tool_result` TEHOZ `tool_use_id` uz nic nedokazuje (agent uz na
+        nej odpoved mel, kdyz rekl `end_turn`), takze signal konce nerusi — a tah se zavre na
+        skutecne finalni odpovedi. Id task1 musi byt v transkripci OTEVRENO `tool_use` zaznamem,
+        jinak by bylo NEZNAME, a neznamy id rusi dal (`test_vysledek_s_neznamym_id_signal_konce_rusi`)
+        — ten test by pak mel opacny vysledek."""
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
             b._status_push = lambda *a, **k: None
@@ -245,12 +254,92 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
             b._end_turn()
             self.assertIn("hotovo", "\n".join(b.tg.sent))
 
+    def test_replay_po_rewindu_tpos_se_nezavre_uprostred_prace(self):
+        """⭐ BLOKUJICI nalez opraveny v `11bd6a9`: `_closed_calls`/`_answered_calls`-only pareni
+        (`8e1a7c0`) PREZIVALO rewind `_tpos` na 0 (zkraceny prepis, prepnuti souboru pres
+        `_maybe_reresolve`), takze pri REPLAYi stejneho `tool_use`+`tool_result` byl kazdy
+        vysledek viden jako duplikat, signal se nezrusil a tah se zavrel, dokud agent jeste
+        pracoval — presne to selhani, kvuli kteremu cela tahle cesta vznikla.
+
+        Test vede most SKUTECNOU cestou rewindu, ne dvojim volanim readeru: po prvnim pruchodu
+        (end_turn → cancel vysledkem task1, presne jako `test_vysledek_nastroje_po_end_turn_zrusi_signal_konce`)
+        se `_tpos`/`_tg_since` vynuluji presne tak, jak to dela `_drain_transcript` pri zjistenem
+        zkraceni souboru, a STEJNY prepis (`tool_use` → `end_turn`) se napise a zdrenuje znovu —
+        to je replay. Tah nesmi v zadnem okamziku REPLAYe zustat `ready=True`, dokud `task1` opet
+        neni vyrizen; teprve genuinne NOVA finalni odpoved tah zavre."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _regrese_bridge(td)
+            b._status_push = lambda *a, **k: None
+            transcript = Path(td) / "t.jsonl"
+            b._transcript = transcript
+            b.cfg.turn_end_quiet_seconds = 0.05
+
+            b._handle(_msg(1, "[TG] zjisti neco"))
+            b._turn_begun_at -= 5
+
+            before_result = [
+                _user_record("[TG] zjisti neco"),
+                _toolrec("task1", name="Task"),
+                _arec("[tg] hotovo", stop="end_turn", uuid="u1"),
+            ]
+
+            # --- prvni pruchod ---
+            _write_transcript(transcript, before_result)
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "test setup is wrong: end_turn s task1 jeste otevrenym musi signal vztycit",
+            )
+
+            _append_transcript(transcript, [_resultrec("task1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertFalse(
+                b._transcript_turn_end_ready(),
+                "test setup is wrong: prvni vysledek task1 musi signal zrusit",
+            )
+
+            # --- REWIND: presne to, co `_drain_transcript` dela pri zjistenem zkraceni souboru
+            # (`size < self._tpos`) — `_tpos` i `_tg_since` na 0, stejny obsah se precte znovu.
+            b._tpos = 0
+            b._tg_since = 0
+            _write_transcript(transcript, before_result)
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "test setup is wrong: replay end_turnu musi signal vztycit znovu",
+            )
+
+            _append_transcript(transcript, [_resultrec("task1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertFalse(
+                b._transcript_turn_end_ready(),
+                "BLOKUJICI: replay vysledku task1 signal konce nezrusil — tah by se zavrel "
+                "uprostred prace, presne jako pred opravou 11bd6a9",
+            )
+
+            # Genuinne NOVA finalni odpoved musi tah zavrit normalne.
+            _append_transcript(transcript, [_arec("[tg] skutecna odpoved", stop="end_turn", uuid="u9")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "skutecna odpoved po replayi tah zavrit musi",
+            )
+            b._end_turn()
+            self.assertIn("skutecna odpoved", "\n".join(b.tg.sent))
+
     def test_vysledek_s_neznamym_id_signal_konce_rusi(self):
         """Negativni protivaha k predchozimu testu: vysledek s ID, ktere tento reader NIKDY
-        nevidel (zadny parujici `tool_use`, zadny drivejsi vysledek), musi signal konce rusit dal
-        — to je bezpecny smer (`continues_turn`'s docstring: "the unknown id included"). Kdyby se
-        tahle vetev omylem zacala chovat jako u ZNAMEHO/vyrizeneho volani, tah by se zavrel
-        uprostred prace a skutecna odpoved by se nikdy neprepose."""
+        nevidel (ani jako `_open_calls`, ani jako `_closed_calls`), musi signal konce rusit dal —
+        to je jeden ze tri stavu `continues_turn` rozlisuje (`agent2telegram/readers.py`): NEZNAME
+        cancelluje stejne jako OTEVRENE, protoze most mohl pripojit uprostred tahu
+        (`_resume_position` zacina uvnitr souboru) — "nevim" neni "uzavreno". Kdyby se tahle vetev
+        omylem zacala chovat jako u ZNAMEHO/uzavreneho volani, tah by se zavrel uprostred prace a
+        skutecna odpoved by se nikdy neprepose."""
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
             b._status_push = lambda *a, **k: None
@@ -285,8 +374,9 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
         """Nalez z revize: `test_sidechain_end_turn_nezavre_hlavni_tah` a
         `test_vysledek_nastroje_po_end_turn_zrusi_signal_konce` merily kazdy jen svuj kousek
         oddelene — jeden sidechain `end_turn` bez navazujiciho `tool_result`, druhy pozdni
-        `tool_result` bez `Task` volani a bez predchoziho skutecneho `end_turn` v sekvenci. Tenhle
-        test jde celou posloupnosti najednou — `Task tool_use` → sidechain `end_turn` (nedotkne se
+        `tool_result` POTVRZENEHO (otevreneho) `Task` volani, ale bez sidechain odbocky a bez
+        predchoziho skutecneho `end_turn` hlavniho agenta V TETO sekvenci. Tenhle test jde celou
+        posloupnosti najednou — `Task tool_use` → sidechain `end_turn` (nedotkne se
         hlavniho tahu) → hlavni agent sam napise zaznam se `stop_reason: end_turn` DRIV, nez se
         `task1` dokonci (presne ten zavod, ktery API umi vyrobit) → teprve PAK dorazi `task1`
         `tool_result`, ktery tenhle predcasny signal musi zrusit — a tah zustane otevreny az do
