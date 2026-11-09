@@ -163,7 +163,10 @@ class JednaZpravaNaTahTests(unittest.TestCase):
             b2._turn_from_tg = True
             b2._turn_text_sent = False
             b2._turn_sent_keys = set()
-            b2._batch = []
+            # `_batch` is deliberately NOT reset here: pre-setting it to `[]` would force the
+            # exact value the real restart path must produce on its own (via `_drain_transcript`
+            # re-reading from `_tpos = 0`), and so would hide a regression where that rebuild
+            # goes wrong — this is precisely the state the test name claims to measure.
             b2._batch_streaming = False
             b2._turn_begun_at = time.monotonic()
             b2._tg_since = 0
