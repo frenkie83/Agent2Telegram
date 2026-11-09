@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections import deque
 import os
 import urllib.parse
@@ -121,11 +122,20 @@ class ClaudeCodeReader:
     name = "claude-code"
     emits_turn_end = False
 
-    _ANSWERED_LIMIT = 4096
+    _CALL_LIMIT = 4096
 
     def __init__(self) -> None:
-        # Insertion-ordered: the oldest answered call id is the one dropped over the limit.
-        self._answered_calls: "dict[str, bool]" = {}
+        # Tool calls seen in this stream: `_open_calls` = `tool_use` seen, result not yet;
+        # `_closed_calls` = result already seen. Insertion-ordered, so the oldest is the one
+        # dropped over the limit. `_lock` guards both — `continues_turn` and `parse` are called
+        # from the drain, which the bridge runs from more than one thread.
+        self._open_calls: "dict[str, bool]" = {}
+        self._closed_calls: "dict[str, bool]" = {}
+        self._lock = threading.Lock()
+
+    def _trim(self, d: "dict[str, bool]") -> None:
+        while len(d) > self._CALL_LIMIT:
+            del d[next(iter(d))]
 
     @staticmethod
     def _is_tool_result(rec: dict) -> bool:
@@ -175,24 +185,36 @@ class ClaudeCodeReader:
         after the record that raised it and the whole path would never fire — the failure it was
         built to fix, through another door.
 
-        A result whose call this reader has ALREADY seen answered says nothing about now: a
-        duplicate or a late re-filed result of an old call would otherwise cancel a valid
-        "end_turn" and leave the turn hanging until the idle fallback. Everything else keeps
-        cancelling, the unknown id included — the two failures are not symmetrical. Cancelling
-        when the agent was in fact done costs a late message; NOT cancelling while it still works
-        closes the turn mid-flight and the real answer is never forwarded, which is the incident
-        this whole path was built for.
+        A result of a call whose result was ALREADY seen says nothing about now: a duplicate, or
+        an old call's result re-filed late, would otherwise cancel a valid "end_turn" and leave
+        the turn hanging until the idle fallback.
+
+        Three states, not two, because an id this reader never saw called is a different thing
+        from one it saw answered:
+          * some id still OPEN (`tool_use` seen, no result yet) → the agent is working → cancel.
+          * some id UNKNOWN → cannot tell → cancel. The bridge may have attached mid-turn
+            (`_resume_position` starts inside the file), so "no `tool_use` seen" is not "closed".
+          * every id already CLOSED → this result is a repeat → do NOT cancel.
+        ⭐ Open beats closed, which is what makes a REPLAY safe: the bridge rewinds `_tpos` to 0
+        when the transcript is truncated or when it switches files, and reads the whole file
+        again. The `tool_use` records are replayed first and put their ids back among the open
+        ones, so the second pass behaves like the first — no invalidation from the outside needed.
+        ⛔ Had this kept "already answered" instead, a replay would see every result as a repeat,
+        cancel nothing and close the turn while the agent worked. The two failures are not
+        symmetrical: cancelling when the agent was in fact done costs a late message, while NOT
+        cancelling mid-work closes the turn mid-flight and the real answer is never forwarded —
+        the incident this whole path was built for.
         """
         if rec.get("type") != "user" or not self._is_tool_result(rec):
             return False
         ids = self._tool_result_ids(rec)
-        if ids and all(i in self._answered_calls for i in ids):
-            return False
-        for i in ids:
-            self._answered_calls[i] = True
-            # Bounded: the bridge runs for weeks and a turn can make thousands of calls.
-            if len(self._answered_calls) > self._ANSWERED_LIMIT:
-                del self._answered_calls[next(iter(self._answered_calls))]
+        with self._lock:
+            if ids and all(i in self._closed_calls and i not in self._open_calls for i in ids):
+                return False
+            for i in ids:
+                self._open_calls.pop(i, None)
+                self._closed_calls[i] = True
+            self._trim(self._closed_calls)
         return True
 
     def parse(self, rec: dict):
@@ -225,6 +247,12 @@ class ClaudeCodeReader:
                 if paths:
                     yield Ev("files", key=tid, files=paths)
                     continue                      # not a tool bubble — it is an attachment
+                with self._lock:
+                    # A replayed `tool_use` moves its id back to open on purpose — see
+                    # `continues_turn`: that is what makes rewinding `_tpos` safe.
+                    self._closed_calls.pop(tid, None)
+                    self._open_calls[tid] = True
+                    self._trim(self._open_calls)
                 yield Ev("tool", text=_claude_tool_summary(b.get("name", ""), b.get("input")), key=tid)
         # LAST, after the tool events of this very record. "end_turn" is the API's own word for
         # "I stopped, nothing is pending" — a POSITIVE statement about this record, unlike
