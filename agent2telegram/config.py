@@ -53,6 +53,19 @@ class Config:
     origin_prefix: str = "Telegram:"    # injected before each message; hook forwards only these
     claude_session_id: str = ""         # guard: only act on this session's transcript
     progress_marker: str = "[tg]"       # lines starting with this are sent live (interim)
+    # One turn = ONE Telegram message. Texts the agent writes between tool calls are collected and
+    # delivered together when the turn ends, because 26 separate "FWD (delivered)" messages in one
+    # evening (2026-11-08, one bridge) read as scraps with no end. A LONG turn must not go silent
+    # though: once this many seconds have passed since the turn started, the next text is sent at
+    # once and the rest of the turn streams as before. 0 switches batching off entirely (the
+    # pre-2026-11-09 behaviour), so it can be reverted without redeploying code.
+    turn_batch_seconds: float = 180.0
+    # Claude Code only: end a turn from the TRANSCRIPT when its last record is an assistant message
+    # that ended its turn (stop_reason "end_turn", i.e. no tool call pending). The Stop hook stays
+    # the primary signal; this is the second, independent path for when it never fires (measured
+    # 2026-11-09: a session running since 2026-11-07 fired the hook zero times). The wait is there
+    # so the turn is not closed between two blocks of one answer. 0 switches the path off.
+    turn_end_quiet_seconds: float = 2.0
     bot_username: str = ""              # the bot's @username (non-secret; for t.me/ deep links)
     # Directories the agent may send files FROM (see `file_marker`). Deliberately narrow:
     # the path comes from the agent's own reply text, so a wide allowlist would turn a
@@ -102,6 +115,12 @@ class Config:
             raise ConfigError("'poll_timeout' must be positive.")
         if self.mode not in ("oneshot", "attach"):
             raise ConfigError("'mode' must be one of: oneshot, attach.")
+        for name in ("turn_batch_seconds", "turn_end_quiet_seconds"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(f"'{name}' must be a number of seconds (0 = off).")
+            if value < 0:
+                raise ConfigError(f"'{name}' must not be negative (0 = off).")
 
     def redacted(self) -> dict:
         """A copy safe to print/log: the token is masked."""

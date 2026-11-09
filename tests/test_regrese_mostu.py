@@ -267,6 +267,7 @@ class QueuedMidTurnMessageGetsAnAnswerTests(unittest.TestCase):
             ])
 
             b._drain_transcript()
+            b._finish_turn()        # one turn = one message: delivery happens at the turn's end
 
             self.assertIn(
                 "yes, still here", "\n".join(b.tg.sent),
@@ -353,7 +354,7 @@ class ToolResultMidTurnDoesNotCancelTelegramOriginTests(unittest.TestCase):
             ])
 
             b._drain_transcript()
-            b._finish_turn()
+            b._finish_turn()        # one turn = one message: delivery happens at the turn's end
 
             joined = "\n".join(b.tg.sent)
             self.assertIn(
@@ -362,7 +363,7 @@ class ToolResultMidTurnDoesNotCancelTelegramOriginTests(unittest.TestCase):
                 "answer never left the bridge, the backstop never ran, and nothing was logged",
             )
             self.assertEqual(
-                b.tg.sent.count("it shows the dashboard after the deploy"), 1,
+                joined.count("it shows the dashboard after the deploy"), 1,
                 "must be delivered exactly once — a second send would mean the backstop fired "
                 "as well as the normal transcript path (2026-08-02 duplicate-send class of bug)",
             )
@@ -384,6 +385,7 @@ class ToolResultMidTurnDoesNotCancelTelegramOriginTests(unittest.TestCase):
             ])
 
             b._drain_transcript()
+            b._finish_turn()        # one turn = one message: delivery happens at the turn's end
 
             self.assertIn("looks fine, nothing to fix", "\n".join(b.tg.sent),
                           "answer lost when a tool result preceded any interim reply")
@@ -413,13 +415,15 @@ class ToolResultMidTurnDoesNotCancelTelegramOriginTests(unittest.TestCase):
             ])
 
             b._drain_transcript()
-
+            # The origin is checked BEFORE the turn ends — that is where it used to be lost. The
+            # answer itself only leaves at the turn's end now (one turn = one message).
             self.assertTrue(
                 b._turn_from_tg,
                 "a plain machine-written note with no origin prefix downgraded a RUNNING "
                 "Telegram turn to local — the reader-level tool-result filter cannot see this "
                 "record at all, so only the turn-active guard can save it",
             )
+            b._finish_turn()
             self.assertIn(
                 "it shows the dashboard after the deploy", "\n".join(b.tg.sent),
                 "the final answer was lost because the turn was silently reclassified as local",

@@ -14,6 +14,12 @@ on-disk transcript format of one agent and maps its records to a common set of e
                    the call id (so the same call isn't pushed twice).
   ``turn_end``   — the turn finished. Codex writes ``task_complete`` (so no Stop hook is needed!);
                    Claude Code has none, so the bridge ends the turn via its Stop-hook marker / idle.
+  ``assistant_done`` — Claude Code only: THIS record is an assistant message that ended its turn
+                   (``stop_reason: "end_turn"`` — no tool call pending). It is a statement about
+                   one record, not about the turn: the bridge only knows the turn ended if no
+                   further record follows (see ``AttachBridge._transcript_turn_end_ready``). It is
+                   emitted LAST within its record, after the text and tool events, so a record
+                   that does call a tool cancels it by the events' own order.
 
 Why an abstraction instead of an ``if agent == ...`` in the bridge: the two formats differ a lot
 (Claude = one assistant record with text+tool_use blocks and a uuid; Codex = separate event_msg /
@@ -32,7 +38,7 @@ from dataclasses import dataclass
 
 @dataclass
 class Ev:
-    kind: str               # turn_start | user | text | tool | files | turn_end
+    kind: str               # turn_start | user | text | tool | files | turn_end | assistant_done
     text: str = ""          # message / tool-summary text
     key: str = ""           # stable dedup id (text uuid/hash, tool call id)
     final: bool = False      # for 'text': hint that this is the final answer
@@ -155,8 +161,10 @@ class ClaudeCodeReader:
         # the next call re-creates it below (the bridge relies on this order).
         text = "\n".join(b.get("text", "") for b in blocks
                          if isinstance(b, dict) and b.get("type") == "text").strip()
+        stop = (rec.get("message") or {}).get("stop_reason")
         if text:
-            yield Ev("text", text=text, key=rec.get("uuid", "") or _hash(text))
+            yield Ev("text", text=text, key=rec.get("uuid", "") or _hash(text),
+                     final=stop == "end_turn")
         for b in blocks:
             if isinstance(b, dict) and b.get("type") == "tool_use":
                 tid = b.get("id")
@@ -167,6 +175,12 @@ class ClaudeCodeReader:
                     yield Ev("files", key=tid, files=paths)
                     continue                      # not a tool bubble — it is an attachment
                 yield Ev("tool", text=_claude_tool_summary(b.get("name", ""), b.get("input")), key=tid)
+        # LAST, after the tool events of this very record. "end_turn" is the API's own word for
+        # "I stopped, nothing is pending" — a POSITIVE statement about this record, unlike
+        # "the file has been quiet for a while". A record that calls a tool carries stop_reason
+        # "tool_use" and emits no such event at all.
+        if stop == "end_turn":
+            yield Ev("assistant_done", key=rec.get("uuid", ""))
 
 
 # --------------------------------------------------------------------------- Codex

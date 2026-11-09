@@ -57,6 +57,21 @@ def _reaction(message_id=42, emoji="❤"):
                                  "new_reaction": [{"type": "emoji", "emoji": emoji}]}}
 
 
+def _late_final_bridge(tmpdir):
+    """`_regrese_bridge()` with batching switched OFF (`turn_batch_seconds = 0`).
+
+    Every test below has the same premise: an interim reply ALREADY delivered mid-turn, and a
+    final text that lands in the same second as the end of the turn (T-0404). Batching — one
+    turn, one message — holds that interim reply back by design, so leaving it on would change
+    these tests' setup rather than what they measure. The interaction between batching and this
+    very check (the batch is flushed at the top of `_finish_turn`, before the final check runs)
+    is pinned in tests/test_jedna_zprava_na_tah.py.
+    """
+    b = _regrese_bridge(tmpdir)
+    b.cfg.turn_batch_seconds = 0
+    return b
+
+
 def _bridge(tmpdir):
     b = object.__new__(AttachBridge)
     b.cfg = Config(agent="generic", token="1:2", allowed_user_ids=[7], tmux_session="a2t")
@@ -261,7 +276,7 @@ class LateFinalAnswerRealTranscriptAndReaderTests(unittest.TestCase):
 
     def test_final_text_appended_after_the_interim_drain_still_arrives_exactly_once(self):
         with tempfile.TemporaryDirectory() as d:
-            b = _regrese_bridge(d)
+            b = _late_final_bridge(d)
             transcript = Path(d) / "transcript.jsonl"
             b._transcript = transcript
             b._tpos = 0
@@ -327,7 +342,7 @@ class LateFinalCheckDrainsBeforeScanningTests(unittest.TestCase):
 
     def test_two_texts_written_after_the_last_drain_arrive_in_order_exactly_once(self):
         with tempfile.TemporaryDirectory() as d:
-            b = _regrese_bridge(d)
+            b = _late_final_bridge(d)
             transcript = Path(d) / "transcript.jsonl"
             b._transcript = transcript
             b._tpos = 0
@@ -393,7 +408,7 @@ class LateFinalCheckWaitsOnlyForADefinitiveEndTests(unittest.TestCase):
 
     def test_a_definitive_end_waits_for_a_final_answer_that_has_not_started_writing_yet(self):
         with tempfile.TemporaryDirectory() as d:
-            b = _regrese_bridge(d)
+            b = _late_final_bridge(d)
             transcript = Path(d) / "transcript.jsonl"
             b._transcript = transcript
             b._tpos = 0
@@ -429,7 +444,7 @@ class LateFinalCheckWaitsOnlyForADefinitiveEndTests(unittest.TestCase):
 
     def test_a_non_definitive_end_never_waits(self):
         with tempfile.TemporaryDirectory() as d:
-            b = _regrese_bridge(d)
+            b = _late_final_bridge(d)
             transcript = Path(d) / "transcript.jsonl"
             b._transcript = transcript
             b._tpos = 0
@@ -512,7 +527,7 @@ class LateFinalCheckLogsWhenNothingToSendTests(unittest.TestCase):
 
     def test_logs_a_line_when_the_transcripts_last_text_was_already_forwarded(self):
         with tempfile.TemporaryDirectory() as d:
-            b = _regrese_bridge(d)
+            b = _late_final_bridge(d)
             transcript = Path(d) / "transcript.jsonl"
             b._transcript = transcript
             b._tpos = 0
@@ -586,7 +601,7 @@ class DurableOutboxRepliesAreNotResentByTheLateFinalCheckTests(unittest.TestCase
 
     def test_reply_genuinely_enqueued_to_the_durable_outbox_is_not_resent(self):
         with tempfile.TemporaryDirectory() as d:
-            b = _regrese_bridge(d)
+            b = _late_final_bridge(d)
             b._use_durable_outbox = True          # the thing the old test's name promised
             transcript = Path(d) / "transcript.jsonl"
             b._transcript = transcript
@@ -649,7 +664,7 @@ class TechnicalBubbleIsClearedAfterTheLateFinalDrainTests(unittest.TestCase):
 
     def test_bubble_created_by_the_late_final_drain_is_cleared(self):
         with tempfile.TemporaryDirectory() as d:
-            b = _regrese_bridge(d)
+            b = _late_final_bridge(d)
             b.tg = _FakeClient()
             transcript = Path(d) / "transcript.jsonl"
             b._transcript = transcript
