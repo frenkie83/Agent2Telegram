@@ -144,6 +144,23 @@ class ClaudeCodeReader:
             return None
         return _text_of(rec.get("message", {}).get("content"))
 
+    def continues_turn(self, rec: dict) -> bool:
+        """Does this record PROVE the agent is still working? Only a tool RESULT does.
+
+        It exists for the transcript end-of-turn signal (`AttachBridge`): a result means a call
+        was outstanding, so whatever "end_turn" was seen before it did not end the main turn — a
+        sub-agent's (`Task`) answer followed by its result is exactly that shape. The reader
+        yields no event at all for these records (on purpose — a tool result is not a prompt,
+        see `_is_tool_result`), so without this the bridge cannot see them.
+
+        ⛔ It is deliberately NOT "any record the reader ignores". Claude Code writes a
+        housekeeping `attachment` (`total_tokens_reminder`) after nearly every turn, and often a
+        `queue-operation` as well; treating those as "still working" would cancel the signal just
+        after the record that raised it and the whole path would never fire — the failure it was
+        built to fix, through another door.
+        """
+        return rec.get("type") == "user" and self._is_tool_result(rec)
+
     def parse(self, rec: dict):
         typ = rec.get("type")
         if typ == "user":
@@ -179,7 +196,11 @@ class ClaudeCodeReader:
         # "I stopped, nothing is pending" — a POSITIVE statement about this record, unlike
         # "the file has been quiet for a while". A record that calls a tool carries stop_reason
         # "tool_use" and emits no such event at all.
-        if stop == "end_turn":
+        # ⛔ Never for a SUB-AGENT record. Claude Code files a Task/sub-agent conversation with
+        # `isSidechain: True`, and its last message ends ITS turn with "end_turn" while the main
+        # agent is still working — taking that for the main turn's end closes the turn before the
+        # real answer is written, and the answer is then never forwarded.
+        if stop == "end_turn" and not rec.get("isSidechain"):
             yield Ev("assistant_done", key=rec.get("uuid", ""))
 
 

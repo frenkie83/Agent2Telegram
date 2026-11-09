@@ -670,6 +670,29 @@ class AttachBridge:
     def _split_keys(key: "str | None") -> list:
         return [k for k in (key or "").split() if k]
 
+    def _queued_keys(self) -> set:
+        """Every dedup id currently WAITING in a queue — durable outbox and the legacy list.
+
+        The ledger alone cannot answer "did this text already go out?", because it is written
+        only after Telegram confirms. During an outage a reply sits in the durable queue,
+        unconfirmed and unledgered; a restart then re-reads the turn's records
+        (`_resume_position`) and would hand the very same text to `_send_final` again. The
+        outbox's own key-based dedup used to catch that, and a BATCHED message breaks it: its key
+        is the ids of all its texts, which never equals the single id the re-read produces. So
+        ask the queue itself what it is holding.
+        """
+        keys: set = set()
+        outbox = self._ensure_outbox()
+        if outbox is not None:
+            try:
+                for rec in outbox.pending():
+                    keys.update(self._split_keys(rec.key))
+            except Exception as e:                       # a queue read must never stop delivery
+                log.warning("could not read the queued dedup ids: %s", e)
+        for item in getattr(self, "_pending_send", ()) or ():
+            keys.update(self._split_keys(item.get("key")))
+        return keys
+
     def _mark_sent_keys(self, key: "str | None") -> bool:
         """Mark every dedup id a (possibly batched) message carried. False if any disk write failed
         — then the record must stay queued, exactly as for a single key."""
@@ -926,6 +949,11 @@ class AttachBridge:
         parts = self._split_keys(key)
         if parts and all(p in self._sent_keys for p in parts):
             return
+        if parts:
+            queued = self._queued_keys()
+            if queued and all(p in self._sent_keys or p in queued for p in parts):
+                log.info("not forwarding again: already waiting in the queue id=%s", key)
+                return
         if key and turn_text:
             # Remember WHICH text went out, not just THAT something did. `_sent_keys` is marked
             # only after Telegram confirms, so a reply already durably queued would look unsent to
@@ -1072,6 +1100,13 @@ class AttachBridge:
                     return
                 outbox.mark_file_sent(rec.record_id, file_path)
             if vzdano:
+                # The TEXT of this record may well have been delivered in full (chunks are
+                # confirmed one by one, the attachment is what gave up) — then its ids belong in
+                # the ledger, or a restart re-reads those texts and sends them again. With a
+                # batched message that is N texts, not one. Only when every chunk is confirmed:
+                # an unfinished text must stay re-sendable.
+                if rec.key and not rec.pending_chunks:
+                    self._mark_sent_keys(rec.key)
                 continue          # the record is in dead-letter, the queue moves on
             if rec.key and not self._mark_sent_keys(rec.key):
                 # The ledger write failed → the record STAYS in the queue. Delivered parts are
@@ -1527,7 +1562,14 @@ class AttachBridge:
         self._last_typing = now
         self._turn_text_sent = False             # gate TUI bubbles until intro text lands
         self._turn_sent_keys = set()             # which texts this turn forwarded (turn-end check)
-        self._batch = []                         # one turn = one message (see _forward_turn_text)
+        # A batch is emptied by SENDING it, never by assignment. A second Telegram message joins
+        # a RUNNING turn (`_handle` injects without waiting), so a plain reset here would drop
+        # what the turn has written so far: `_tpos` is already past those records, the ledger does
+        # not have them, and nothing ever reads them again — the backstop rescues at most the LAST
+        # text, nothing before it. Same reasoning as `_tg_since` a few lines up, which is not
+        # moved for exactly this reason.
+        self._flush_batch(reason="a new message joined the turn")
+        self._batch = []
         self._batch_streaming = False
         self._turn_done_at = None                # the previous turn's end says nothing about this one
         self._turn_done_offset = None
@@ -2068,6 +2110,27 @@ class AttachBridge:
         log.info("TURN BATCH → one message (%s): %d texts, %d chars, ids=%s",
                  reason, len(batch), len(text), key or "-")
 
+    def _flush_overdue_batch(self) -> None:
+        """Deliver a held batch once the long-turn limit has passed, even if no further text came.
+
+        Checking the limit only when the NEXT text arrives satisfies the letter of "send the
+        nearest next text at once" and misses its point: a turn that writes one sentence and then
+        only calls tools for half an hour would hold that sentence for half an hour, and the user
+        sees nothing but "typing…". It is also what keeps the batch independent of the end of the
+        turn — on a session whose turns never end (no Stop hook, `turn_end_quiet_seconds = 0`)
+        this is the only thing that delivers it at all.
+        """
+        if not getattr(self, "_batch", None) or getattr(self, "_batch_streaming", False):
+            return
+        if not (self._turn_active.is_set() and self._turn_from_tg):
+            return
+        limit = self._batch_limit()
+        started = getattr(self, "_turn_begun_at", 0.0)
+        if limit <= 0 or not started or time.monotonic() - started < limit:
+            return
+        self._batch_streaming = True
+        self._flush_batch(reason="long turn, not staying silent")
+
     def _forward_turn_text(self, out: str, key: str) -> None:
         """One assistant text of a Telegram turn: held for the end of the turn, or sent at once.
 
@@ -2086,6 +2149,18 @@ class AttachBridge:
         self._send_final(out, key=key)
 
     # ---- end of turn from the transcript itself (no Stop hook) ------------------------
+    def _record_continues_turn(self, rec: dict) -> bool:
+        """Does this transcript record prove the agent is still working? The READER decides — it
+        is the one that knows the format (a reader without the method answers "no", which only
+        means it does not drive the transcript end-of-turn path)."""
+        decide = getattr(self._reader, "continues_turn", None)
+        if decide is None:
+            return False
+        try:
+            return bool(decide(rec))
+        except Exception:
+            return True          # unreadable record → assume work continues, never close early
+
     def _transcript_turn_end_ready(self) -> bool:
         """Did the TRANSCRIPT say this turn is over? A second path to the end of a turn, needed
         because the Stop hook is not a given: measured 2026-11-09, a Claude session running since
@@ -2143,6 +2218,13 @@ class AttachBridge:
         """
         seq_at_entry = getattr(self, "_turn_seq", 0)
         self._status_clear()
+        # Nothing is held from here on. Both checks below DRAIN, and a drain hands new texts to
+        # `_handle_event`, which would batch them while the turn still counts as active — into a
+        # batch nobody flushes again, so an interim text written just before the end of the turn
+        # would be lost (the final check only ever rescues the LAST text). It also keeps
+        # `_unsent_final_text`'s own premise true: the drain forwards every complete record the
+        # normal way.
+        self._batch_streaming = True
         # FIRST, before every check below: the turn is over, so whatever it collected goes out as
         # one message. It has to happen here and not after, because the two checks below ask
         # "did this turn send its answer?" — over a batch that is still being held, the backstop
@@ -2303,6 +2385,7 @@ class AttachBridge:
                 self._flush_pending()         # re-deliver any reply a prior send failed to push
                 self._drain_transcript()      # may set _pending_turn_end (Codex task_complete)
                 self._drain_signal()
+                self._flush_overdue_batch()   # a long turn must not stay silent
                 # End-of-turn detection, in priority order:
                 #   * Codex: the reader saw task_complete → end now (no hook needed).
                 #   * Claude Code: the Stop hook wrote the end-of-turn marker. Authoritative even
@@ -2427,6 +2510,11 @@ class AttachBridge:
         if not answer:
             return
         if answer and self._owner_chat is not None:
+            # This path clears the turn WITHOUT `_finish_turn`, so nothing else would ever flush
+            # the batch: every turn-end path needs `_turn_active`. The turn's interim texts go
+            # out first, the signal's final answer after them.
+            self._batch_streaming = True
+            self._flush_batch(reason="the signal file carried the final answer")
             self._status_clear()                         # final message → drop the technical bubble
             self._send_final(answer)                     # reliable: queue + retry on send failure
             self._turn_active.clear()
@@ -2460,6 +2548,13 @@ class AttachBridge:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # A tool RESULT yields no event at all (it is not a prompt), so the signal has to be
+            # dropped from the record itself — otherwise an "end_turn" seen BEFORE an outstanding
+            # call's result survived it and the turn was declared over while the agent worked on.
+            # A sub-agent's (`Task`) answer followed by its result is exactly that shape.
+            if self._record_continues_turn(rec):
+                self._turn_done_at = None
+                self._turn_done_offset = None
             for ev in self._reader.parse(rec):
                 self._handle_event(ev, offset=rec_offset)
         # Any new transcript content during a Telegram turn = the agent is still working; refresh
@@ -2578,10 +2673,11 @@ class AttachBridge:
         ``offset`` is the byte offset of the record this event came from; the transcript
         end-of-turn signal uses it to tell its own turn's records from older ones.
         """
-        # Anything that is not the end-of-turn signal itself means the transcript CONTINUED, so
-        # the record that carried the signal is no longer the last one. The reader emits
-        # `assistant_done` last within its record, so a record that calls a tool cancels it by
-        # the events' own order — no timing involved.
+        # Any other event means the transcript CONTINUED, so the record that raised the signal
+        # is no longer the last one. Together with `_record_continues_turn` (for records that
+        # produce no event) this is what makes the signal a statement about the LAST record. The
+        # reader emits `assistant_done` last within its own record, so a record that also calls
+        # a tool never leaves it raised — by the events' order, with no timing involved.
         if ev.kind != "assistant_done":
             self._turn_done_at = None
             self._turn_done_offset = None
