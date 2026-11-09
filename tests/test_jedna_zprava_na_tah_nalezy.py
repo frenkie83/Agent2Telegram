@@ -7,8 +7,6 @@ import time
 import unittest
 from pathlib import Path
 
-from agent2telegram.attach import AttachBridge
-
 from tests.test_regrese_mostu import _regrese_bridge, _write_transcript, _user_record
 from tests.test_unik_do_chatu import _append_transcript
 from tests.test_v2_durability import _msg
@@ -93,10 +91,16 @@ class DruhaZpravaUprostredTahuTest(unittest.TestCase):
 
 
 class PodagentNezavreHlavniTahTest(unittest.TestCase):
-    """Nalez 2 (+ 2b): Task tool_use a sidechain end_turn nesmi zavrit hlavni tah, ani vysledek
-    nastroje; uklidovy attachment zaznam za koncem tahu signal konce take nerusi."""
+    """Nalez 2 (+ 2b): Task tool_use a sidechain end_turn nesmi zavrit hlavni tah; uklidovy
+    attachment zaznam za koncem tahu signal konce take nerusi.
 
-    def test_sidechain_end_turn_a_vysledek_nastroje_hlavni_tah_nezavrou(self):
+    Druha cast nalezu 2 — vysledek nastroje prichazejici PO end_turn hlavniho agenta — je ve
+    vlastnim testu nize (`test_vysledek_nastroje_po_end_turn_zrusi_signal_konce`): v teto tride
+    zde je v okamziku `_resultrec` jiz `_turn_done_at` None (sidechain zaznam zadny
+    `assistant_done` nevyrobi), takze assert na `_resultrec` v tomhle tvaru nic nemeril — viz
+    revize."""
+
+    def test_sidechain_end_turn_nezavre_hlavni_tah(self):
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
             b._status_push = lambda *a, **k: None
@@ -122,14 +126,6 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
                 "sidechain end_turn (vysledek podagenta) zavrel hlavni tah",
             )
 
-            _append_transcript(transcript, [_resultrec("task1")])
-            b._drain_transcript()
-            time.sleep(0.25)
-            self.assertFalse(
-                b._transcript_turn_end_ready(),
-                "vysledek nastroje Task zavrel hlavni tah",
-            )
-
             _append_transcript(transcript, [_arec("[tg] skutecna odpoved", stop="end_turn", uuid="u3")])
             b._drain_transcript()
             time.sleep(0.25)
@@ -139,6 +135,43 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
             )
             b._end_turn()
             self.assertIn("skutecna odpoved", "\n".join(b.tg.sent))
+
+    def test_vysledek_nastroje_po_end_turn_zrusi_signal_konce(self):
+        """Blokujici nalez z revize: `continues_turn` vykuchane na `return False` nechalo celou
+        sadu zelenou, protoze v puvodnim tvaru byl `_turn_done_at` uz None (sidechain zadny
+        `assistant_done` neprodukuje) — ready byla False nezavisle na `continues_turn`. Tenhle
+        tvar overil reviewer mutaci: na cistem kode True -> False, s vykuchanym `continues_turn`
+        True -> True (overeno mutaci `continues_turn` na `return False`, viz popis PR)."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _regrese_bridge(td)
+            b._status_push = lambda *a, **k: None
+            transcript = Path(td) / "t.jsonl"
+            b._transcript = transcript
+            b.cfg.turn_end_quiet_seconds = 0.05
+
+            b._handle(_msg(1, "[TG] zjisti neco"))
+            b._turn_begun_at -= 5
+
+            _write_transcript(transcript, [
+                _user_record("[TG] zjisti neco"),
+                _toolrec("task1", name="Task"),
+                _arec("[tg] hotovo", stop="end_turn", uuid="u1"),
+            ])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "end_turn hlavniho agenta bez pokracovani tah zavrit musi",
+            )
+
+            _append_transcript(transcript, [_resultrec("task1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertFalse(
+                b._transcript_turn_end_ready(),
+                "vysledek nastroje prichazejici PO end_turn musi signal konce zrusit — "
+                "nastroj byl v okamziku end_turn jeste nedoreseny, agent pracuje dal",
+            )
 
     def test_uklidovy_attachment_za_koncem_tahu_signal_konce_nerusi(self):
         with tempfile.TemporaryDirectory() as td:
@@ -165,7 +198,14 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
 
 
 class TextBehemKonceTahuTest(unittest.TestCase):
-    """Nalez 3: text, ktery dorazi do prepisu behem konce tahu, se neztrati ani neodejde dvakrat."""
+    """Nalez 3: text, ktery dorazi do prepisu BEHEM konce tahu (ne pred nim), se neztrati ani
+    neodejde dvakrat.
+
+    Technika je stejna jako v `tests/test_attach_backstop.py:432` — `_wait_backstop_retry` se
+    prepise na funkci, ktera text dopise do prepisu AZ za behu cekani uvnitr `_finish_turn`
+    (`_unsent_final_text`). Dopsani B a C PRED volanim `_finish_turn()` (jak to delala puvodni
+    verze tohoto testu) by je pobral uz prvni drain uvnitr, a retry smycka z T-0404 by se vubec
+    nespustila — test by prosel i kdyby prestala fungovat."""
 
     def test_text_dorazivsi_behem_konce_tahu_se_neztrati_ani_neodesle_dvakrat(self):
         with tempfile.TemporaryDirectory() as td:
@@ -180,11 +220,16 @@ class TextBehemKonceTahuTest(unittest.TestCase):
                 _arec("[tg] A prubezne", uuid="uA"),
             ])
             b._drain_transcript()
+            self.assertEqual(b.tg.sent, [], "A je jen drzena davkou, jeste nesmi odejit")
 
-            _append_transcript(transcript, [
-                _arec("[tg] B prubezne", uuid="uB"),
-                _arec("[tg] C finalni", stop="end_turn", uuid="uC"),
-            ])
+            def _dopis_b_a_c_behem_cekani():
+                _append_transcript(transcript, [
+                    _arec("[tg] B prubezne", uuid="uB"),
+                    _arec("[tg] C finalni", stop="end_turn", uuid="uC"),
+                ])
+
+            b._wait_backstop_retry = _dopis_b_a_c_behem_cekani
+
             b._finish_turn()
 
             joined = "\n".join(b.tg.sent)
@@ -237,7 +282,15 @@ class RestartNadVisiciDavkouTest(unittest.TestCase):
             pending2 = b2._ensure_outbox().pending()
             self.assertEqual(len(pending2), 1, "restart vyrobil duplikat ve fronte")
 
-            b2.tg.sent.clear()
+            # `_finish_turn()` on a durable-outbox bridge only ENQUEUES — it must not have pushed
+            # anything straight to Telegram on its own. Asserting this directly (instead of
+            # clearing `b2.tg.sent` right before the real check) keeps the evidence a duplicate
+            # send here would leave.
+            self.assertEqual(
+                b2.tg.sent, [],
+                "_finish_turn by nemel nic poslat primo — jen zapsat do fronty; "
+                f"primy odesl pred obnovou site by byl duplikat: {b2.tg.sent!r}",
+            )
             b2._flush_pending()
             self.assertEqual(
                 b2.tg.sent, ["A\n\nB"],
@@ -250,12 +303,16 @@ class MezDlouhehoTahuBezDalsihoTextuTest(unittest.TestCase):
     behem behu smycky (_flush_overdue_batch)."""
 
     def test_mez_se_uplatni_i_bez_dalsiho_textu_jen_behem_smycky(self):
+        # `_flush_overdue_batch` compares `time.monotonic() - _turn_begun_at` against the limit
+        # (see `agent2telegram/attach.py`). Moving `_turn_begun_at` itself, instead of sleeping on
+        # the wall clock, makes both sides of this test deterministic — a loaded machine cannot
+        # turn "mez jeste neuplynula" into a false positive by being slow for 200ms.
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
             b._status_push = lambda *a, **k: None
             transcript = Path(td) / "t.jsonl"
             b._transcript = transcript
-            b.cfg.turn_batch_seconds = 0.2
+            b.cfg.turn_batch_seconds = 2.0
 
             b._handle(_msg(1, "[TG] ahoj"))
             _write_transcript(transcript, [
@@ -268,7 +325,7 @@ class MezDlouhehoTahuBezDalsihoTextuTest(unittest.TestCase):
             b._flush_overdue_batch()
             self.assertEqual(b.tg.sent, [], "mez jeste neuplynula — nesmi odejit")
 
-            time.sleep(0.25)
+            b._turn_begun_at -= 5  # mez (2.0 s) uz je dávno za námi, bez spoléhání na real sleep
             b._flush_overdue_batch()  # zadny novy text, jen beh smycky
             self.assertEqual(
                 b.tg.sent, ["jedna veta"],

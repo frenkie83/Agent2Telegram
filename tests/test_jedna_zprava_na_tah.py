@@ -163,10 +163,15 @@ class JednaZpravaNaTahTests(unittest.TestCase):
             b2._turn_from_tg = True
             b2._turn_text_sent = False
             b2._turn_sent_keys = set()
-            # `_batch` is deliberately NOT reset here: pre-setting it to `[]` would force the
-            # exact value the real restart path must produce on its own (via `_drain_transcript`
-            # re-reading from `_tpos = 0`), and so would hide a regression where that rebuild
-            # goes wrong — this is precisely the state the test name claims to measure.
+            # `_batch` is deliberately left at its class default here rather than force-set to
+            # `[]` — `_batch` is NOT what this test actually checks (`AttachBridge._batch = ()`
+            # and `[]` are indistinguishable to every reader of it, `_flush_batch`/
+            # `_flush_overdue_batch` both read it through `getattr(self, "_batch", ()) or ()`, so
+            # setting one or the other changes nothing). What catches a real dedup regression
+            # below is the ASSERTION on `b2.tg.sent` after the drain + finish — proven by mutating
+            # the `ev.key not in self._sent_keys` guard in `AttachBridge._handle_event` out: with
+            # that guard gone, this test's last two asserts fail (`sent[0]` becomes all three
+            # texts joined, not just the new one).
             b2._batch_streaming = False
             b2._turn_begun_at = time.monotonic()
             b2._tg_since = 0
