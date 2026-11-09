@@ -36,6 +36,19 @@ def _toolrec(tid, name="Bash", sidechain=False):
     }
 
 
+def _filetoolrec(tid, paths):
+    """A `SendUserFile` tool_use — the harness runs it itself, so the reader only ever sees this
+    record and its result (see `agent2telegram.readers._file_tool_paths`)."""
+    return {
+        "type": "assistant",
+        "uuid": "t-" + tid,
+        "message": {
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": tid, "name": "SendUserFile", "input": {"files": paths}}],
+        },
+    }
+
+
 def _resultrec(tid):
     return {
         "type": "user",
@@ -261,12 +274,18 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
         vysledek viden jako duplikat, signal se nezrusil a tah se zavrel, dokud agent jeste
         pracoval — presne to selhani, kvuli kteremu cela tahle cesta vznikla.
 
-        Test vede most SKUTECNOU cestou rewindu, ne dvojim volanim readeru: po prvnim pruchodu
-        (end_turn → cancel vysledkem task1, presne jako `test_vysledek_nastroje_po_end_turn_zrusi_signal_konce`)
-        se `_tpos`/`_tg_since` vynuluji presne tak, jak to dela `_drain_transcript` pri zjistenem
-        zkraceni souboru, a STEJNY prepis (`tool_use` → `end_turn`) se napise a zdrenuje znovu —
-        to je replay. Tah nesmi v zadnem okamziku REPLAYe zustat `ready=True`, dokud `task1` opet
-        neni vyrizen; teprve genuinne NOVA finalni odpoved tah zavre."""
+        Test vede most SKUTECNOU cestou rewindu, ne dvojim volanim readeru, ani rucnim predsazenim
+        `_tpos`/`_tg_since` — ten rucni reset by zakryl prave tu detekci, kterou chceme merit
+        (revize). Po prvnim pruchodu (end_turn → cancel vysledkem task1, presne jako
+        `test_vysledek_nastroje_po_end_turn_zrusi_signal_konce`) se `before_result` zapise ZNOVU
+        se stejnym obsahem — soubor se tim fyzicky ZKRATI (ztraci append-nuty `tool_result`), a
+        `_drain_transcript`'s vlastni detekce zkraceni (`size < self._tpos`) vynuluje `_tpos`
+        SAMA, bez naseho zasahu. To je replay. Druhe misto rewindu —`_maybe_reresolve` (prepnuti
+        souboru) — je zvlast nize
+        (`test_replay_pri_prepnuti_souboru_pres_maybe_reresolve_se_nezavre_uprostred_prace`).
+
+        Tah nesmi v zadnem okamziku REPLAYe zustat `ready=True`, dokud `task1` opet neni
+        vyrizen; teprve genuinne NOVA finalni odpoved tah zavre."""
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
             b._status_push = lambda *a, **k: None
@@ -299,13 +318,18 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
                 b._transcript_turn_end_ready(),
                 "test setup is wrong: prvni vysledek task1 musi signal zrusit",
             )
+            tpos_pred_rewindem = b._tpos
 
-            # --- REWIND: presne to, co `_drain_transcript` dela pri zjistenem zkraceni souboru
-            # (`size < self._tpos`) — `_tpos` i `_tg_since` na 0, stejny obsah se precte znovu.
-            b._tpos = 0
-            b._tg_since = 0
+            # --- REWIND vyvolany SAMOTNOU detekci, ne predsazeny: stejny obsah znovu, soubor je
+            # tim KRATSI nez aktualni `_tpos` (prisel o appendnuty `tool_result`), takze
+            # `_drain_transcript` rewind udela sam, pri prvnim dalsim volani.
             _write_transcript(transcript, before_result)
             b._drain_transcript()
+            self.assertLess(
+                b._tpos, tpos_pred_rewindem,
+                "test setup is wrong: zkraceny soubor musel vynutit vlastni detekci rewindu "
+                "(size < _tpos), jinak tenhle test meri neco jineho",
+            )
             time.sleep(0.1)
             self.assertTrue(
                 b._transcript_turn_end_ready(),
@@ -331,6 +355,133 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
             )
             b._end_turn()
             self.assertIn("skutecna odpoved", "\n".join(b.tg.sent))
+
+    def test_replay_senduserfile_se_nezavre_uprostred_prace(self):
+        """Nalez z revize (`b823791`): `parse` ted registruje KAZDE volani do `_open_calls` PRED
+        vetvenim na attachment (`if paths: ... continue`), ne jen to, co se zmeni v bublinu
+        nastroje. Pred opravou by `SendUserFile` registrovalo id jen svym VYSLEDKEM
+        (`continues_turn`), takze na replay by se chovalo jinak nez `Task` — zmereno: `Task`
+        True/True (spravne), `SendUserFile` True/False (spatne, tah by se zavrel pri replayi,
+        presne ten blokujici nalez, jen dverma jineho nastroje). Test je tvarem shodny s
+        `test_replay_po_rewindu_tpos_se_nezavre_uprostred_prace`, jen s `SendUserFile` tool_use
+        misto `Task`."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _regrese_bridge(td)
+            b._status_push = lambda *a, **k: None
+            transcript = Path(td) / "t.jsonl"
+            b._transcript = transcript
+            b.cfg.turn_end_quiet_seconds = 0.05
+
+            b._handle(_msg(1, "[TG] poslat soubor"))
+            b._turn_begun_at -= 5
+
+            before_result = [
+                _user_record("[TG] poslat soubor"),
+                _filetoolrec("file1", ["/tmp/some.txt"]),
+                _arec("[tg] hotovo", stop="end_turn", uuid="u1"),
+            ]
+
+            # --- prvni pruchod ---
+            _write_transcript(transcript, before_result)
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "test setup is wrong: end_turn s file1 jeste otevrenym musi signal vztycit",
+            )
+
+            _append_transcript(transcript, [_resultrec("file1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertFalse(
+                b._transcript_turn_end_ready(),
+                "test setup is wrong: prvni vysledek file1 musi signal zrusit",
+            )
+            tpos_pred_rewindem = b._tpos
+
+            # --- REWIND vyvolany samotnou detekci zkraceni, stejne jako u Tasku vyse.
+            _write_transcript(transcript, before_result)
+            b._drain_transcript()
+            self.assertLess(b._tpos, tpos_pred_rewindem, "test setup is wrong: rewind se nespustil")
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "test setup is wrong: replay end_turnu musi signal vztycit znovu",
+            )
+
+            _append_transcript(transcript, [_resultrec("file1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertFalse(
+                b._transcript_turn_end_ready(),
+                "replay vysledku SendUserFile volani (file1) signal konce nezrusil — tah by se "
+                "zavrel uprostred prace, presne jako Task pred opravou b823791",
+            )
+
+    def test_replay_pri_prepnuti_souboru_pres_maybe_reresolve_se_nezavre_uprostred_prace(self):
+        """Druhe misto rewindu: `_maybe_reresolve` prepne `self._transcript` na novy soubor a
+        vynuluje `_tpos`/`_tg_since` primo (ne detekci velikosti) tesne pred volanim
+        `_resume_position()`. Samoopravnost replaye tam zavisi na tom, ze `_resume_position`
+        pocita `size = self._tpos` — v okamziku jejiho volani uz je `_tpos` 0, takze `size=0` a
+        kurzor po najiti posledniho `[TG]` zaznamu zustane na 0, ne skoci na skutecnou delku
+        noveho souboru. Kdyby to nekdo „opravil" na realnou velikost souboru, kurzor by se posunul
+        DOVNITR noveho souboru a replay by zase nebyl samoopravny — bez jedineho cerveneho testu,
+        protoze tenhle rewind nejde pres detekci zkraceni (`size < _tpos`), kterou meri test vyse."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _regrese_bridge(td)
+            b._status_push = lambda *a, **k: None
+            transcript = Path(td) / "t.jsonl"
+            b._transcript = transcript
+            b.cfg.turn_end_quiet_seconds = 0.05
+
+            b._handle(_msg(1, "[TG] zjisti neco"))
+            b._turn_begun_at -= 5
+
+            before_result = [
+                _user_record("[TG] zjisti neco"),
+                _toolrec("task1", name="Task"),
+                _arec("[tg] hotovo", stop="end_turn", uuid="u1"),
+            ]
+
+            _write_transcript(transcript, before_result)
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(b._transcript_turn_end_ready(), "test setup is wrong")
+
+            _append_transcript(transcript, [_resultrec("task1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertFalse(b._transcript_turn_end_ready(), "test setup is wrong")
+
+            # --- REWIND pres _maybe_reresolve: NOVY soubor se stejnym obsahem, bridge na nej
+            # prepne sam — zadne rucni `_tpos = 0` z naseho testu.
+            transcript2 = Path(td) / "t2.jsonl"
+            _write_transcript(transcript2, before_result)
+            b._last_resolve = 0.0
+            b._resolve_transcript = lambda: transcript2
+            b._session_cwd = lambda: "whatever-not-none"  # at nebrani prepnuti uprostred tahu
+            b._signal = None    # _publish_transcript neni predmetem tohoto testu
+            b._maybe_reresolve()
+
+            self.assertEqual(b._transcript, transcript2, "test setup is wrong: neprepnulo se")
+            self.assertEqual(b._tpos, 0, "test setup is wrong: _resume_position musi kurzor "
+                              "vratit na 0 (size=_tpos=0 v okamziku jejiho volani)")
+
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "test setup is wrong: replay end_turnu po prepnuti souboru musi signal vztycit",
+            )
+
+            _append_transcript(transcript2, [_resultrec("task1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertFalse(
+                b._transcript_turn_end_ready(),
+                "replay vysledku task1 PO PREPNUTI SOUBORU signal konce nezrusil — tah by se "
+                "zavrel uprostred prace",
+            )
 
     def test_vysledek_s_neznamym_id_signal_konce_rusi(self):
         """Negativni protivaha k predchozimu testu: vysledek s ID, ktere tento reader NIKDY
