@@ -121,6 +121,12 @@ class ClaudeCodeReader:
     name = "claude-code"
     emits_turn_end = False
 
+    _ANSWERED_LIMIT = 4096
+
+    def __init__(self) -> None:
+        # Insertion-ordered: the oldest answered call id is the one dropped over the limit.
+        self._answered_calls: "dict[str, bool]" = {}
+
     @staticmethod
     def _is_tool_result(rec: dict) -> bool:
         """A ``user`` record that is really a TOOL RESULT, not something the person typed.
@@ -144,6 +150,16 @@ class ClaudeCodeReader:
             return None
         return _text_of(rec.get("message", {}).get("content"))
 
+    @staticmethod
+    def _tool_result_ids(rec: dict) -> "list[str]":
+        """The ids of the calls this tool-result record answers (empty if the file omits them)."""
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            return []
+        return [b["tool_use_id"] for b in content
+                if isinstance(b, dict) and b.get("type") == "tool_result"
+                and isinstance(b.get("tool_use_id"), str) and b.get("tool_use_id")]
+
     def continues_turn(self, rec: dict) -> bool:
         """Does this record PROVE the agent is still working? Only a tool RESULT does.
 
@@ -158,8 +174,26 @@ class ClaudeCodeReader:
         `queue-operation` as well; treating those as "still working" would cancel the signal just
         after the record that raised it and the whole path would never fire — the failure it was
         built to fix, through another door.
+
+        A result whose call this reader has ALREADY seen answered says nothing about now: a
+        duplicate or a late re-filed result of an old call would otherwise cancel a valid
+        "end_turn" and leave the turn hanging until the idle fallback. Everything else keeps
+        cancelling, the unknown id included — the two failures are not symmetrical. Cancelling
+        when the agent was in fact done costs a late message; NOT cancelling while it still works
+        closes the turn mid-flight and the real answer is never forwarded, which is the incident
+        this whole path was built for.
         """
-        return rec.get("type") == "user" and self._is_tool_result(rec)
+        if rec.get("type") != "user" or not self._is_tool_result(rec):
+            return False
+        ids = self._tool_result_ids(rec)
+        if ids and all(i in self._answered_calls for i in ids):
+            return False
+        for i in ids:
+            self._answered_calls[i] = True
+            # Bounded: the bridge runs for weeks and a turn can make thousands of calls.
+            if len(self._answered_calls) > self._ANSWERED_LIMIT:
+                del self._answered_calls[next(iter(self._answered_calls))]
+        return True
 
     def parse(self, rec: dict):
         typ = rec.get("type")
