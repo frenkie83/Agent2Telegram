@@ -3,6 +3,7 @@ ktere chybely v sade. Prevedeno do `unittest`, pouzivaji stejne stavebnice jako
 `tests/test_jedna_zprava_na_tah.py` a `tests/test_regrese_mostu.py`.
 """
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -177,6 +178,64 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
                 "typu zaznamu",
             )
 
+    def test_cela_posloupnost_task_sidechain_end_turn_tool_result_nezavre_hlavni_tah(self):
+        """Nalez z revize: `test_sidechain_end_turn_nezavre_hlavni_tah` a
+        `test_vysledek_nastroje_po_end_turn_zrusi_signal_konce` merily kazdy jen svuj kousek
+        oddelene — jeden sidechain `end_turn` bez navazujiciho `tool_result`, druhy pozdni
+        `tool_result` bez `Task` volani a bez predchoziho skutecneho `end_turn` v sekvenci. Tenhle
+        test jde celou posloupnosti najednou — `Task tool_use` → sidechain `end_turn` (nedotkne se
+        hlavniho tahu) → hlavni agent sam napise zaznam se `stop_reason: end_turn` DRIV, nez se
+        `task1` dokonci (presne ten zavod, ktery API umi vyrobit) → teprve PAK dorazi `task1`
+        `tool_result`, ktery tenhle predcasny signal musi zrusit — a tah zustane otevreny az do
+        skutecne finalni odpovedi. Bez teto mezikrocke (`stop_reason: end_turn` PRED
+        `tool_result`) by `_turn_done_at` nikdy nebyl `True` v okamziku, kdy `tool_result`
+        dorazi, a cely test by byl vuci `continues_turn` slepy."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _regrese_bridge(td)
+            b._status_push = lambda *a, **k: None
+            transcript = Path(td) / "t.jsonl"
+            b._transcript = transcript
+            b.cfg.turn_end_quiet_seconds = 0.05
+
+            b._handle(_msg(1, "[TG] zjisti neco"))
+            b._turn_begun_at -= 5
+
+            _write_transcript(transcript, [
+                _user_record("[TG] zjisti neco"),
+                _arec("[tg] deleguji", stop=None, uuid="u1"),
+                _toolrec("task1", name="Task"),
+                {"type": "user", "isSidechain": True,
+                 "message": {"role": "user", "content": "You are a subagent..."}},
+                _arec("subagent: hotovo", stop="end_turn", uuid="u2", sidechain=True),
+                _arec("[tg] hotovo (predcasny zavod s task1)", stop="end_turn", uuid="u3"),
+            ])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "test setup is wrong: hlavni agent uz rekl end_turn, signal musi byt vztyceny "
+                "pred tim, nez ho `task1` zrusi — jinak dalsi assert nic nemeri",
+            )
+
+            _append_transcript(transcript, [_resultrec("task1")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertFalse(
+                b._transcript_turn_end_ready(),
+                "vysledek KONKRETNIHO Task volani z teto posloupnosti nezrusil predcasny "
+                "signal konce — tah by se zavrel, dokud `task1` jeste bezel",
+            )
+
+            _append_transcript(transcript, [_arec("[tg] skutecna odpoved", stop="end_turn", uuid="u4")])
+            b._drain_transcript()
+            time.sleep(0.1)
+            self.assertTrue(
+                b._transcript_turn_end_ready(),
+                "skutecna odpoved hlavniho agenta tah zavrit musi",
+            )
+            b._end_turn()
+            self.assertIn("skutecna odpoved", "\n".join(b.tg.sent))
+
     def test_uklidovy_attachment_za_koncem_tahu_signal_konce_nerusi(self):
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
@@ -306,7 +365,18 @@ class RestartNadVisiciDavkouTest(unittest.TestCase):
 
 class MezDlouhehoTahuBezDalsihoTextuTest(unittest.TestCase):
     """Nalez 5: mez dlouheho tahu (turn_batch_seconds) se uplatni i bez dalsiho textu — jen
-    behem behu smycky (_flush_overdue_batch)."""
+    behem behu smycky, a navic pres skutecne TELO `_outbound_loop`, ne jen volanim pomocne
+    metody `_flush_overdue_batch` napřímo. Technika jedne iterace smycky je stejna jako
+    `JednaZpravaNaTahTests.test_idle_done_zustava_poslednim_zpusobem_konce_tahu`
+    (`tests/test_jedna_zprava_na_tah.py`): `_beat` se prepise na `_stop.set()`, takze
+    `_outbound_loop()` provede presne jeden pruchod a vrati se."""
+
+    def _jedna_iterace_smycky(self, b):
+        b._last_resolve = time.monotonic()      # skip re-resolution — not under test here
+        b._last_inbound_retry = time.monotonic()
+        b._last_activity = time.monotonic()
+        b._beat = lambda: b._stop.set()
+        b._outbound_loop()
 
     def test_mez_se_uplatni_i_bez_dalsiho_textu_jen_behem_smycky(self):
         # `_flush_overdue_batch` compares `time.monotonic() - _turn_begun_at` against the limit
@@ -328,14 +398,16 @@ class MezDlouhehoTahuBezDalsihoTextuTest(unittest.TestCase):
             b._drain_transcript()
             self.assertEqual(b.tg.sent, [])
 
-            b._flush_overdue_batch()
+            self._jedna_iterace_smycky(b)
             self.assertEqual(b.tg.sent, [], "mez jeste neuplynula — nesmi odejit")
 
             b._turn_begun_at -= 5  # mez (2.0 s) uz je dávno za námi, bez spoléhání na real sleep
-            b._flush_overdue_batch()  # zadny novy text, jen beh smycky
+            b._stop = threading.Event()         # nova iterace — predchozi _beat uz ji vypnul
+            self._jedna_iterace_smycky(b)       # zadny novy text, jen beh tela smycky
             self.assertEqual(
                 b.tg.sent, ["jedna veta"],
-                "po uplynuti meze musi smycka davku vyklopit, i kdyz nedorazil zadny novy text",
+                "po uplynuti meze musi SMYCKA (ne jen pomocna metoda samotna) davku vyklopit, "
+                "i kdyz nedorazil zadny novy text",
             )
 
 
