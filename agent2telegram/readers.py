@@ -129,6 +129,11 @@ class ClaudeCodeReader:
     # whole snapshot fail — it only logs a warning, so the protection would silently stop working
     # and the symptom would be a shifted dedup window, not a red test. Sharing one lock between
     # reader instances costs nothing: it is held for a few dict operations and never nested.
+    # What it does NOT claim: that the bridge drains from several threads. Today every path into
+    # `_drain_transcript` / `_last_assistant_text` comes from `_outbound_loop`. The lock is here
+    # so that a second caller would not interleave these maps, not as a record of one existing —
+    # the one real cross-thread touch (`_reader_unchanged`'s restore) holds no lock at all and is
+    # handled in `_calls` instead.
     _lock = threading.Lock()
 
     def __init__(self) -> None:
@@ -142,6 +147,23 @@ class ClaudeCodeReader:
     def _trim(self, d: "dict[str, bool]") -> None:
         while len(d) > self._CALL_LIMIT:
             del d[next(iter(d))]
+
+    def _calls(self) -> "tuple[dict[str, bool], dict[str, bool]]":
+        """The two call maps, re-created if the instance dictionary was emptied under us.
+
+        `AttachBridge._reader_unchanged` restores reader state with `vars(reader).clear()` +
+        `update(saved)`, and that restore holds no lock. A `parse` that happened to run inside
+        that window would raise `AttributeError`, and the drain has already advanced `_tpos` past
+        the chunk it is reading — so the rest of that chunk, final answer included, would be lost
+        for good. An empty state is harmless here: an unknown id cancels the end-of-turn signal,
+        which is the safe direction.
+        """
+        try:
+            return self._open_calls, self._closed_calls
+        except AttributeError:
+            self._open_calls = {}
+            self._closed_calls = {}
+            return self._open_calls, self._closed_calls
 
     @staticmethod
     def _is_tool_result(rec: dict) -> bool:
@@ -205,6 +227,9 @@ class ClaudeCodeReader:
         when the transcript is truncated or when it switches files, and reads the whole file
         again. The `tool_use` records are replayed first and put their ids back among the open
         ones, so the second pass behaves like the first — no invalidation from the outside needed.
+        That holds only because `parse` registers EVERY call, including the ones that turn into
+        an attachment rather than a tool bubble; a call registered only by its result would be
+        "closed" on the replay and cancel nothing.
         ⛔ Had this kept "already answered" instead, a replay would see every result as a repeat,
         cancel nothing and close the turn while the agent worked. The two failures are not
         symmetrical: cancelling when the agent was in fact done costs a late message, while NOT
@@ -215,12 +240,13 @@ class ClaudeCodeReader:
             return False
         ids = self._tool_result_ids(rec)
         with self._lock:
-            if ids and all(i in self._closed_calls and i not in self._open_calls for i in ids):
+            open_calls, closed_calls = self._calls()
+            if ids and all(i in closed_calls and i not in open_calls for i in ids):
                 return False
             for i in ids:
-                self._open_calls.pop(i, None)
-                self._closed_calls[i] = True
-            self._trim(self._closed_calls)
+                open_calls.pop(i, None)
+                closed_calls[i] = True
+            self._trim(closed_calls)
         return True
 
     def parse(self, rec: dict):
@@ -247,18 +273,23 @@ class ClaudeCodeReader:
         for b in blocks:
             if isinstance(b, dict) and b.get("type") == "tool_use":
                 tid = b.get("id")
-                if not tid:
-                    continue
+                if not tid or not isinstance(tid, str):
+                    continue          # a non-string id would not even be usable as a dict key
+                # BEFORE the file-tool branch below returns: every call this record makes counts,
+                # whatever bubble it turns into. A `SendUserFile` registered only by its RESULT
+                # would behave differently on a replay than on the first pass — the very failure
+                # `continues_turn` was rewritten to remove, through one tool's door.
+                with self._lock:
+                    open_calls, closed_calls = self._calls()
+                    # A replayed `tool_use` moves its id back to open on purpose — see
+                    # `continues_turn`: that is what makes rewinding `_tpos` safe.
+                    closed_calls.pop(tid, None)
+                    open_calls[tid] = True
+                    self._trim(open_calls)
                 paths = _file_tool_paths(b.get("name", ""), b.get("input"))
                 if paths:
                     yield Ev("files", key=tid, files=paths)
                     continue                      # not a tool bubble — it is an attachment
-                with self._lock:
-                    # A replayed `tool_use` moves its id back to open on purpose — see
-                    # `continues_turn`: that is what makes rewinding `_tpos` safe.
-                    self._closed_calls.pop(tid, None)
-                    self._open_calls[tid] = True
-                    self._trim(self._open_calls)
                 yield Ev("tool", text=_claude_tool_summary(b.get("name", ""), b.get("input")), key=tid)
         # LAST, after the tool events of this very record. "end_turn" is the API's own word for
         # "I stopped, nothing is pending" — a POSITIVE statement about this record, unlike
