@@ -165,13 +165,14 @@ class JednaZpravaNaTahTests(unittest.TestCase):
             b2._turn_sent_keys = set()
             # `_batch` is deliberately left at its class default here rather than force-set to
             # `[]` — `_batch` is NOT what this test actually checks (`AttachBridge._batch = ()`
-            # and `[]` are indistinguishable to every reader of it, `_flush_batch`/
-            # `_flush_overdue_batch` both read it through `getattr(self, "_batch", ()) or ()`, so
-            # setting one or the other changes nothing). What catches a real dedup regression
-            # below is the ASSERTION on `b2.tg.sent` after the drain + finish — proven by mutating
-            # the `ev.key not in self._sent_keys` guard in `AttachBridge._handle_event` out: with
-            # that guard gone, this test's last two asserts fail (`sent[0]` becomes all three
-            # texts joined, not just the new one).
+            # and `[]` are falsy the same way to both readers of it, so setting one or the other
+            # changes nothing). What catches a real dedup regression below is the ASSERTION on
+            # `b2.tg.sent` after the drain + finish — proven by mutating the `ev.key not in
+            # self._sent_keys` guard in `AttachBridge._handle_event` out: with that guard gone,
+            # the two old texts and the new one all merge into the SAME batched message, so the
+            # count stays 1 but its content does not — the `sent[0]` equality below fails
+            # (`"already delivered one\n\nalready delivered two\n\nnever sent before the restart"`
+            # instead of just the new text).
             b2._batch_streaming = False
             b2._turn_begun_at = time.monotonic()
             b2._tg_since = 0

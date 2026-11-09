@@ -137,11 +137,15 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
             self.assertIn("skutecna odpoved", "\n".join(b.tg.sent))
 
     def test_vysledek_nastroje_po_end_turn_zrusi_signal_konce(self):
-        """Blokujici nalez z revize: `continues_turn` vykuchane na `return False` nechalo celou
-        sadu zelenou, protoze v puvodnim tvaru byl `_turn_done_at` uz None (sidechain zadny
-        `assistant_done` neprodukuje) — ready byla False nezavisle na `continues_turn`. Tenhle
-        tvar overil reviewer mutaci: na cistem kode True -> False, s vykuchanym `continues_turn`
-        True -> True (overeno mutaci `continues_turn` na `return False`, viz popis PR)."""
+        """`continues_turn` rozhoduje jen podle TYPU zaznamu (je to vysledek nastroje?), ne podle
+        toho, jestli k nemu existuje nedoreseny tool_use — proto zadny `_toolrec` v setupu neni:
+        jeden by byl inertni (na vysledek testu by nemel vliv) a jen by predstiral parovani
+        volani/vysledku, ktere se tu nemeri.
+
+        Puvodni tvar tohoto testu mel v setupu i `Task` zaznam a hlasku, ktera tvrdila presne to
+        parovani — bez dukazu. Co se mutaci overilo: zrusit `continues_turn` na vzdy `False`
+        nechava `_transcript_turn_end_ready()` po pozdnim vysledku nastroje `True` (misto spravne
+        `False`) — ready zustane `True -> True`, tah se zavre, dokud agent jeste pracuje."""
         with tempfile.TemporaryDirectory() as td:
             b = _regrese_bridge(td)
             b._status_push = lambda *a, **k: None
@@ -154,7 +158,6 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
 
             _write_transcript(transcript, [
                 _user_record("[TG] zjisti neco"),
-                _toolrec("task1", name="Task"),
                 _arec("[tg] hotovo", stop="end_turn", uuid="u1"),
             ])
             b._drain_transcript()
@@ -169,8 +172,9 @@ class PodagentNezavreHlavniTahTest(unittest.TestCase):
             time.sleep(0.1)
             self.assertFalse(
                 b._transcript_turn_end_ready(),
-                "vysledek nastroje prichazejici PO end_turn musi signal konce zrusit — "
-                "nastroj byl v okamziku end_turn jeste nedoreseny, agent pracuje dal",
+                "vysledek nastroje prichazejici PO end_turn musi signal konce zrusit, i bez "
+                "parujiciho tool_use v teto transkripci — continues_turn se rozhoduje jen podle "
+                "typu zaznamu",
             )
 
     def test_uklidovy_attachment_za_koncem_tahu_signal_konce_nerusi(self):
@@ -201,7 +205,9 @@ class TextBehemKonceTahuTest(unittest.TestCase):
     """Nalez 3: text, ktery dorazi do prepisu BEHEM konce tahu (ne pred nim), se neztrati ani
     neodejde dvakrat.
 
-    Technika je stejna jako v `tests/test_attach_backstop.py:432` — `_wait_backstop_retry` se
+    Technika je stejna jako v `tests/test_attach_backstop.py`,
+    `test_a_definitive_end_waits_for_a_final_answer_that_has_not_started_writing_yet` —
+    `_wait_backstop_retry` se
     prepise na funkci, ktera text dopise do prepisu AZ za behu cekani uvnitr `_finish_turn`
     (`_unsent_final_text`). Dopsani B a C PRED volanim `_finish_turn()` (jak to delala puvodni
     verze tohoto testu) by je pobral uz prvni drain uvnitr, a retry smycka z T-0404 by se vubec
