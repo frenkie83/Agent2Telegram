@@ -34,12 +34,61 @@ import threading
 import unittest
 from pathlib import Path
 
-import pytest
-
 from agent2telegram.attach import AttachBridge
 from agent2telegram.config import Config
 
 LOGGER_NAME = "agent2telegram.attach"
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self, sink: list) -> None:
+        super().__init__(level=0)
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._sink.append(record)
+
+
+class _CapturedLog:
+    """What the test bodies below call `self.caplog` — the two things they use of pytest's
+    fixture, `set_level(level, logger=...)` and `.text`, and nothing else.
+
+    Why it exists instead of the fixture: this file used to import pytest at the top, and pytest
+    is not installed here — nor does CI install it (it runs `python -m unittest discover -s
+    tests` plus pyflakes). On an import error `unittest discover` does not load the module AT
+    ALL: it produces a single `_FailedTest`, so NONE of the 21 tests below ever ran. The file
+    whose whole subject is "the bridge must not claim a delivery it never made" (the 2026-08-28
+    incident) was therefore guarding nothing. Measured over e059ab4: 381 tests with one error
+    before, 402 tests with no error after (T-1044). The test bodies are untouched — only the
+    idiom changed, from an autouse fixture to `setUp`.
+
+    Records are collected off the ROOT logger, the way the fixture does it: a child logger
+    propagates to it regardless of the root's own level, so what decides whether an INFO line is
+    seen is the named logger's level — which is exactly what `set_level` sets.
+    """
+
+    def __init__(self) -> None:
+        self.records: list = []
+        self._handler = _ListHandler(self.records)
+        self._levels: list = []
+
+    def start(self) -> None:
+        logging.getLogger().addHandler(self._handler)
+
+    def stop(self) -> None:
+        logging.getLogger().removeHandler(self._handler)
+        for logger, level in reversed(self._levels):   # never leak a level into the next test
+            logger.setLevel(level)
+        self._levels = []
+
+    def set_level(self, level, logger: "str | None" = None) -> None:
+        target = logging.getLogger(logger) if logger else logging.getLogger()
+        self._levels.append((target, target.level))
+        target.setLevel(level)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(f"{r.levelname} {r.name} {r.getMessage()}" for r in self.records)
 
 
 class _FakeClient:
@@ -188,9 +237,10 @@ class HandleReturnsReasonNotTrueTests(unittest.TestCase):
 # B — the worker loop logs what actually happened, not a blanket "delivered"
 # --------------------------------------------------------------------------------------
 class WorkerLoopLogsTruthfullyTests(unittest.TestCase):
-    @pytest.fixture(autouse=True)
-    def _inject_caplog(self, caplog):
-        self.caplog = caplog
+    def setUp(self):
+        self.caplog = _CapturedLog()
+        self.addCleanup(self.caplog.stop)
+        self.caplog.start()
 
     def _wait(self, b, timeout=2.0):
         # queue.Queue.join() only returns once task_done() has run for every item, and in the
@@ -232,9 +282,10 @@ class WorkerLoopLogsTruthfullyTests(unittest.TestCase):
 # C — `_nothing_to_forward`: name it, log it, tell the user, never crash on the telling
 # --------------------------------------------------------------------------------------
 class NothingToForwardTests(unittest.TestCase):
-    @pytest.fixture(autouse=True)
-    def _inject_caplog(self, caplog):
-        self.caplog = caplog
+    def setUp(self):
+        self.caplog = _CapturedLog()
+        self.addCleanup(self.caplog.stop)
+        self.caplog.start()
 
     def test_names_the_kind_in_the_return_value(self):
         b = _bridge()
@@ -296,9 +347,10 @@ class UpdateSkipsAreLoggedAtInfoTests(unittest.TestCase):
     pinned to INFO here on purpose: a regression back to `log.debug` must make these fail,
     not just log something the test isn't looking hard enough for."""
 
-    @pytest.fixture(autouse=True)
-    def _inject_caplog(self, caplog):
-        self.caplog = caplog
+    def setUp(self):
+        self.caplog = _CapturedLog()
+        self.addCleanup(self.caplog.stop)
+        self.caplog.start()
 
     def test_update_below_stored_offset_is_logged_at_info_and_the_offset_does_not_move(self):
         with tempfile.TemporaryDirectory() as td:
@@ -331,9 +383,10 @@ class UpdateSkipsAreLoggedAtInfoTests(unittest.TestCase):
 # E — `_nothing_to_forward` stops heckling service messages, keeps warning about real ones
 # --------------------------------------------------------------------------------------
 class NothingToForwardOnlyNotifiesRealPayloadsTests(unittest.TestCase):
-    @pytest.fixture(autouse=True)
-    def _inject_caplog(self, caplog):
-        self.caplog = caplog
+    def setUp(self):
+        self.caplog = _CapturedLog()
+        self.addCleanup(self.caplog.stop)
+        self.caplog.start()
 
     def test_service_message_stays_silent_while_a_sticker_still_gets_a_reply(self):
         """Both go through the same bridge in the same test so the split is visible: a
