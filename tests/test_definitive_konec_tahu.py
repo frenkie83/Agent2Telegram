@@ -67,13 +67,17 @@ class NonDefinitiveTurnEndsDoNotLowerTheOriginTests(unittest.TestCase):
                 _assistant_record("[tg] Starting the test suite, this will take a while..."),
             ])
             b._drain_transcript()
-            self.assertIn("Starting the test suite", "\n".join(b.tg.sent),
-                          "test setup is wrong: the intro line should have forwarded")
-            b.tg.sent.clear()               # only care about what arrives AFTER the idle fallback
+            self.assertEqual([], b.tg.sent,
+                             "one turn = one message: the intro line is held for the turn's end")
 
             # The transcript goes quiet for 90s+ while the suite runs — _outbound_loop's idle
             # branch fires `self._end_turn(definitive=False)`.
             b._end_turn(definitive=False)
+
+            self.assertIn("Starting the test suite", "\n".join(b.tg.sent),
+                          "a turn closed by the idle fallback must still deliver what it had "
+                          "collected — held text that is never flushed is a lost reply")
+            b.tg.sent.clear()               # only care about what arrives AFTER the idle fallback
 
             self.assertFalse(b._turn_active.is_set(), "the idle fallback must still close the turn")
             self.assertTrue(
