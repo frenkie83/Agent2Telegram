@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections import deque
 import copy
 import glob
+import itertools
 import html
 import json
 import os
@@ -345,6 +346,9 @@ class AttachBridge:
         # holds it and calls `_mark_sent`, which takes it again.
         self._unledgered_keys: set = set()
         self._ledger_lock = threading.RLock()
+        # Per-record count of outbound cycles whose ledger write failed. In memory on purpose —
+        # see the give-up branch in `_flush_pending`. Cleared when the record leaves the queue.
+        self._ledger_attempts: dict = {}
         # Durable outbound queue: a reply whose send HARD-fails (network reset, etc.) is persisted
         # here and re-sent by the outbound loop until Telegram confirms — so a turn's answer is
         # NEVER silently lost. Survives restarts (re-loaded below). Per-bridge (tmux slug).
@@ -771,26 +775,33 @@ class AttachBridge:
                     # belong to a queued record (main outbox) or to none (voice/legacy paths).
                     # Claiming either way would contradict the other branch's line about the very
                     # same key, every tick (rule 1c).
-                    self._ledger_warn("the delivered-message ledger still refuses the write (%s) "
+                    self._ledger_warn("retry", "the delivered-message ledger still refuses the write (%s) "
                                       "— %d id(s) unledgered, retrying every outbound cycle",
                                       e, len(unledgered))
                 elif queued:
-                    self._ledger_warn("could not write the delivered-message ledger (%s) — "
+                    self._ledger_warn("queued", "could not write the delivered-message ledger (%s) — "
                                       "keeping the record queued so the reply is not sent twice", e)
                 else:
                     # ⛔ NOT "kept queued": this path has already delivered and has no queue to
                     # wait in. Saying otherwise tells the operator the reply is safe when a
                     # restart before the disk heals will send it a second time (rule 1c).
-                    self._ledger_warn("could not write the delivered-message ledger (%s) — the "
+                    self._ledger_warn("delivered", "could not write the delivered-message ledger (%s) — the "
                                       "reply is ALREADY delivered and nothing is holding it, so a "
                                       "restart before the disk recovers will send it again; "
                                       "retrying every outbound cycle (%d id(s) unledgered)",
                                       e, len(unledgered))
                 return False
 
-    def _ledger_warn(self, msg: str, *args) -> None:
+    def _ledger_warn(self, kind: str, msg: str, *args) -> None:
         """Log a failed ledger write — the FIRST one in full, then at most one per
-        `LEDGER_WARN_EVERY` seconds.
+        `LEDGER_WARN_EVERY` seconds, THROTTLED PER `kind`.
+
+        ⛔ Per kind, not per bridge: the three messages say different things and one of them is
+        the one the operator actually needs. `_retry_unconfirmed_ledger` is the FIRST statement of
+        `_flush_pending`, so with a single shared slot the retry line (which deliberately says
+        nothing about who holds the record) wins the slot almost every window, and the voice/legacy
+        line — "ALREADY delivered and nothing is holding it … will send it again" — drops to
+        `debug` and disappears at the default level. That is the one sentence rule 1c exists for.
 
         ⛔ Not cosmetic: the outbound loop ticks every `OUTBOUND_TICK` seconds and a failing write
         logs on each tick from two call sites, so an unthrottled line is ~13/s, ~48k an hour, for
@@ -799,13 +810,25 @@ class AttachBridge:
         processes' errors at exactly the moment of the incident. `_last_pane_warning` throttles
         the owner-alert path for the same reason.
         """
-        now = time.monotonic()
-        last = getattr(self, "_last_ledger_warning", 0.0)
-        if last and now - last < LEDGER_WARN_EVERY:
+        if not self._ledger_warn_due(kind):
             log.debug(msg, *args)
             return
-        self._last_ledger_warning = now
         log.error(msg, *args)
+
+    def _ledger_warn_due(self, kind: str) -> bool:
+        """Has `kind` gone quiet for `LEDGER_WARN_EVERY` seconds? Records the decision, so a True
+        starts a new window. Shared by the log lines and by the owner-facing report."""
+        now = time.monotonic()
+        with _LEDGER_INIT_LOCK:
+            seen = getattr(self, "_last_ledger_warning", None)
+            if seen is None:
+                seen = {}
+                self._last_ledger_warning = seen
+            last = seen.get(kind, 0.0)
+            if last and now - last < LEDGER_WARN_EVERY:
+                return False
+            seen[kind] = now
+            return True
 
     def _load_sent_ledger(self) -> set:
         """Read the persisted ledger off `_sent_path`. The ONE implementation of that read —
@@ -844,6 +867,17 @@ class AttachBridge:
                 keys = set()
                 self._unledgered_keys = keys
             return keys
+
+    def _ledger_attempt_counts(self) -> dict:
+        """Per-record count of outbound cycles whose ledger write failed. Lazily created for the
+        same reason as `_unledgered` — hand-built bridges (`selftest`, the tests) never run
+        `__init__`, and a delivery path must not turn into an `AttributeError`."""
+        with _LEDGER_INIT_LOCK:
+            tries = getattr(self, "_ledger_attempts", None)
+            if tries is None:
+                tries = {}
+                self._ledger_attempts = tries
+            return tries
 
     def _ledger_lock_held(self):
         with _LEDGER_INIT_LOCK:
@@ -884,7 +918,11 @@ class AttachBridge:
         # mid-pass. `_mark_sent` takes the lock again per key, so each key is still written under
         # it; what is given up is only the atomicity of the WHOLE pass, which nothing needs.
         with self._ledger_lock_held():
-            batch = list(self._unledgered())[:LEDGER_RETRY_PER_TICK]
+            # `islice`, not `list(...)[:N]`: after a long outage the set holds thousands of keys
+            # (a released record's key stays in it — retrying is the only thing that can still
+            # keep the restart from duplicating that reply), and copying all of them every tick
+            # just to take 50 is work the loop does not have to do.
+            batch = list(itertools.islice(self._unledgered(), LEDGER_RETRY_PER_TICK))
         for key in batch:
             if not self._mark_sent(key, retrying=True):
                 return               # still failing — the next cycle tries again
@@ -1283,14 +1321,30 @@ class AttachBridge:
                 # cycles, exactly 1 delivered. Losing delivery outright is worse than the
                 # duplicate this ledger exists to prevent, so after the retries are spent the
                 # record is released and the owner is TOLD — never silently.
-                attempts = outbox.fail(rec.record_id, f"ledger write failed for {rec.key}")
+                # ⛔ The counter is IN MEMORY, not `outbox.fail()`. Two reasons, both found by
+                # review: (a) `outbox.fail` writes a record through `_atomic_write_bytes`, whose
+                # own docstring says every failure propagates — so counting attempts that way
+                # puts an unprotected disk write on the one path whose usual cause is a disk that
+                # cannot be written, and the `OSError` then escapes `_flush_pending` and takes
+                # the whole outbound cycle (drain, turn end, heartbeat) with it, every tick;
+                # (b) it also never incremented in that case, so the bound this branch exists
+                # for would not hold for ENOSPC at all. (c) `attempts` on the record is shared
+                # with the attachment path, so a record whose attachment failed twice would get
+                # ZERO ledger retries. Per-process counting is enough for what the bound is for
+                # — not blocking the FIFO while this process runs; a restart re-reads the queue
+                # and retries from scratch, which is correct.
+                tries = self._ledger_attempt_counts()
+                attempts = tries.get(rec.record_id, 0) + 1
+                tries[rec.record_id] = attempts
                 if attempts < OUTBOX_MAX_ATTEMPTS:
                     return
+                tries.pop(rec.record_id, None)
                 self._report_ledger_giveup(attempts)
                 log.error("the delivered-message ledger refused %s after %d attempts — releasing "
                           "the record so the queue is not blocked; a restart before the ledger "
                           "is writable again may repeat this reply", rec.key, attempts)
             outbox.done(rec.record_id)
+            self._ledger_attempt_counts().pop(rec.record_id, None)
             # The record id and a text preview are logged ON PURPOSE: on 2026-08-01 the user
             # received one reply twice and the log could not tell whether it was the same
             # message delivered twice or two different ones. Without that, any fix is a guess.
@@ -2827,7 +2881,18 @@ class AttachBridge:
     def _report_ledger_giveup(self, attempts: int) -> None:
         """Tell the owner that delivery continues but the dedup ledger is not recording it. A
         silent drop would be worse than a visible error — and a clogged queue worse still (the
-        same reasoning as `_report_permanent_refusal`, which this mirrors)."""
+        same reasoning as `_report_permanent_refusal`, which this mirrors).
+
+        ⛔ Throttled on the same window as the log lines. Without it a permanently unwritable
+        ledger gives up on EVERY record — one warning per reply, so the chat traffic doubles for
+        the whole outage (measured: 10 replies → 20 messages, ~2.2/s). Telegram's flood control
+        answers 429 and `TelegramClient` sleeps INSIDE the send path, which then delays the real
+        replies and keeps the tick from reaching its heartbeat. `_last_pane_warning` throttles the
+        other owner-alert path for the same reason."""
+        if not self._ledger_warn_due("giveup-report"):
+            log.warning("ledger give-up for another record (%d attempts) — owner already told "
+                        "within the last %.0fs, not repeating it", attempts, LEDGER_WARN_EVERY)
+            return
         try:
             self.tg.send_message(
                 self._owner_chat,

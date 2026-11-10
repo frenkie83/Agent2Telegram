@@ -530,7 +530,8 @@ class RetryReportingDoesNotClaimNothingHoldsAQueuedKeyTests(unittest.TestCase):
                                   "setup: the write must fail so k1 ends up unledgered")
                 self.assertIn("k1", b._unledgered())
 
-                b._last_ledger_warning = 0.0    # don't let the throttle hide this call's line
+                # No throttle reset needed: `_ledger_warn` keeps one window PER MESSAGE KIND and
+                # the setup above used the "queued" one, so "retry" is still untouched here.
                 with self.assertLogs("agent2telegram.attach", level="ERROR") as cm:
                     b._retry_unconfirmed_ledger()
 
