@@ -16,6 +16,12 @@ call is the FIRST statement of `_flush_pending`, the exception took down the WHO
 cycle (drain, turn-end, heartbeat) and delivered nothing. The fix iterates only the small
 `_unledgered_keys` set, under `_ledger_lock`.
 
+⛔ Every bridge here but `RealInitLoadsTheLedgerTests` is hand-built with `object.__new__`, so
+it never runs `__init__`. The ledger read is therefore NOT copied into this file — `_bridge()`
+calls production's `_load_sent_ledger()`, and `RealInitLoadsTheLedgerTests` runs the real
+constructor (temporary `HOME` + a throwaway tmux session) so the `__init__` CALL of it is covered
+too. Before that, gutting the read out of `__init__` left the whole suite green.
+
 ⛔ Trap: `_unledgered()` is lazy so hand-built bridges (this file, `selftest.py`) that set
 `_sent_keys` directly don't blow up with `AttributeError` — a missing `_unledgered_keys`
 attribute just means "nothing has failed yet", which for a hand-built, freshly-constructed
@@ -24,9 +30,13 @@ either way, so (unlike the removed `_ledgered_keys` copy) there is no second sta
 when a test sets `_sent_keys` directly.
 """
 import builtins
+import logging
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 
@@ -55,10 +65,9 @@ def _bridge(state_dir, *, client=None):
     state = Path(state_dir)
     b._sent_path = state / "sent_uuids"
     b._queue_path = state / "outbox.json"
-    try:
-        b._sent_keys = set(b._sent_path.read_text("utf-8").split())
-    except OSError:
-        b._sent_keys = set()
+    # ⛔ Not a copy of production's ledger read — the production function itself, so a change
+    # there cannot leave this file quietly measuring a stale shape (`_load_sent_ledger`).
+    b._sent_keys = b._load_sent_ledger()
     return b
 
 
@@ -129,10 +138,10 @@ class SecondPassRetriesTheWriteTests(unittest.TestCase):
         enough to close the gap (as it would be the first time the record's own branch runs),
         this test would pass even with the `_retry_unconfirmed_ledger()` call deleted from
         `_flush_pending` — which is exactly the gap review found: nothing in the suite called
-        `_flush_pending` a second time over a key with no record left to retry it. Here the
-        outbox record from the first call is already gone from pending (its chunks and files are
-        both empty afterwards is not the point — the KEY itself, 'k2', must still get written by
-        the retry line, not by re-visiting any queued record)."""
+        `_flush_pending` a second time over a key with no record left to retry it. The outbox
+        record from the first call is STILL queued (its ledger write failed), so the second cycle
+        is forced past it by clearing `_owner_chat`: the KEY itself, 'k2', must get written by the
+        retry line, not by re-visiting any queued record."""
         with tempfile.TemporaryDirectory() as td:
             b = _bridge(td)
             outbox = b._ensure_outbox()
@@ -145,7 +154,7 @@ class SecondPassRetriesTheWriteTests(unittest.TestCase):
             # never satisfied, so nothing besides `_retry_unconfirmed_ledger()` has touched k2
             # since. Simulate a cycle where the record itself cannot be retried (e.g. the owner
             # chat vanished) to isolate the retry line from the main branch:
-            b._owner_chat_backup, b._owner_chat = b._owner_chat, None
+            b._owner_chat = None
 
             # Disk heals. Only `_retry_unconfirmed_ledger()`, called at the top of
             # `_flush_pending`, can possibly write k2 now — the main outbox loop does not even
@@ -156,6 +165,8 @@ class SecondPassRetriesTheWriteTests(unittest.TestCase):
                            "the previously failed key must actually be written by the outbound "
                            "cycle's retry, not just by revisiting its own queued record")
             self.assertNotIn("k2", b._unledgered())
+            self.assertEqual(b.tg.sent, [(7, "hello")],
+                              "healing the ledger must not put the text on the wire a second time")
 
 
 # --------------------------------------------------------------------------------------
@@ -189,10 +200,11 @@ class RestartOverSameStateTests(unittest.TestCase):
         a second `_flush_pending` finishes it off — `k1` and `k2` both land on disk and the
         record leaves the queue, matching ordinary (non-restart) operation.
 
-        The restart itself is modelled by `_bridge()` the ordinary way (NOT a copy this test
-        invents): its ledger-loading line is the exact same `read_text().split()` /
-        `except OSError` production uses in `__init__`, so bridge #2's `_sent_keys` is genuinely
-        "what a fresh process reads off disk", not a value this test decides for it.
+        The restart itself is modelled by `_bridge()`, which calls the SAME
+        `_load_sent_ledger()` production calls — not a copy of it — so bridge #2's `_sent_keys` is
+        what that function reads off disk, not a value this test decides for it. ⛔ What this test
+        does NOT cover is the `__init__` CALL of that function; `RealInitLoadsTheLedgerTests`
+        below does, through a real constructor.
         `_unledgered_keys` is deliberately left UNSET — unlike the removed `_ledgered_keys`
         copy, there is nothing to pre-seed any more: a process that has not yet seen a single
         failed write starts with an empty small set, which the lazy `_unledgered()` getter
@@ -258,49 +270,154 @@ class RetryUnconfirmedLedgerCatchesQueuelessKeysTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------------------
-# 6 — the race the 2nd review round found: inbound writes into `_sent_keys` while the outbound
-#     cycle retries the ledger, concurrently, with no exception escaping either side.
+# 6 — the race the 2nd review round found: inbound writes the ledger while the outbound cycle
+#     retries it, concurrently, over a failed set that is genuinely NON-EMPTY the whole time.
 # --------------------------------------------------------------------------------------
 class ConcurrentMarkSentAndRetryTests(unittest.TestCase):
-    def test_mark_sent_from_one_thread_and_retry_from_another_raise_nothing(self):
+    def test_two_threads_over_a_non_empty_failed_set_raise_nothing(self):
         """`_retry_unconfirmed_ledger` used to iterate `_sent_keys` directly. The inbound thread
         (`_flush_batch` → `_send_final` → the voice branch) adds to that very set, so a retry
         pass running at the same time could hit `RuntimeError: Set changed size during
         iteration` — and because the retry call is the FIRST statement of `_flush_pending`, that
         exception took down the whole outbound cycle. The fix iterates only the small
-        `_unledgered_keys` set under `_ledger_lock`; this test fails against the old shape (see
-        the mutation note in the PR) because mutating a set DURING its OWN iteration is reliably
-        caught by CPython, while `_unledgered_keys` is tiny and short-lived enough that two
-        threads churning it never collide with their own iteration of it."""
+        `_unledgered_keys` set, under `_ledger_lock`.
+
+        ⛔ The point of the seeding below: an earlier shape of this test never produced a single
+        FAILED write, so `_unledgered_keys` stayed empty and the retrier walked an empty set
+        every pass. Here the disk refuses EVERY ledger write, so the failed set fills up and
+        stays full, and the test asserts that (`min(seen_sizes)`). No `fsync` ever runs (every
+        write fails), so the run is bounded by a write count, not by a sleep.
+
+        ⛔ What this does NOT cover is `_ledger_lock` itself. Measured: with
+        `_ledger_lock_held()` replaced by `contextlib.nullcontext()` — the lock gone outright,
+        `list()` kept — this test is green 8/8 even at a 1 µs switch interval. `list(a_set)` is a
+        single C call that never releases the GIL, so the window the lock would close does not
+        exist in a GIL build. It is kept for the free-threaded builds and for any future shape
+        where the snapshot is not one C call, and that is a claim no test here can make."""
+        SEED = 3000           # keys already waiting for a disk that never took them
+        WRITES = 5000         # deterministic bound: the writer stops after this many marks
         with tempfile.TemporaryDirectory() as td:
             b = _bridge(td)
             errors = []
-            stop = threading.Event()
+            writes = []
+            seen_sizes = []
 
-            def writer():
-                i = 0
-                while not stop.is_set():
-                    b._mark_sent(f"key-{i}")
-                    i += 1
+            # Every mark logs an error (the write fails by design); 20k of those cost more than
+            # the race does, and would bury a real failure in noise.
+            self.addCleanup(logging.disable, logging.NOTSET)
+            logging.disable(logging.CRITICAL)
+            # The old shape raised only when a thread switch landed INSIDE the comprehension
+            # over `_sent_keys`. At the default switch interval that needs tens of thousands of
+            # marks to hit reliably (measured: 2/5 at 20k, 5/5 at 50k, ~4 s a run); forcing a
+            # short interval makes the same window hit at 5k in well under a second.
+            self.addCleanup(sys.setswitchinterval, sys.getswitchinterval())
+            sys.setswitchinterval(1e-6)
+            with _FailAfter(b._sent_path, fail_from=1):   # the disk takes nothing, ever
+                for i in range(SEED):
+                    b._mark_sent(f"seed-{i}")
+                self.assertGreaterEqual(
+                    len(b._unledgered()), SEED,
+                    "setup: the failed set must be big enough for the race to have a window")
 
-            def retrier():
-                while not stop.is_set():
+                done = threading.Event()
+
+                def writer():
                     try:
-                        b._retry_unconfirmed_ledger()
-                    except Exception as e:                      # pragma: no cover - the assertion
-                        errors.append(e)
-                        stop.set()
+                        for i in range(WRITES):
+                            b._mark_sent(f"key-{i}")
+                            writes.append(i)
+                    except Exception as e:               # pragma: no cover - the assertion
+                        errors.append(("writer", e))
+                    finally:
+                        done.set()
 
-            t1 = threading.Thread(target=writer)
-            t2 = threading.Thread(target=retrier)
-            t1.start()
-            t2.start()
-            time.sleep(1.0)
-            stop.set()
-            t1.join(5)
-            t2.join(5)
+                def retrier():
+                    while not done.is_set():
+                        try:
+                            seen_sizes.append(len(b._unledgered()))
+                            b._retry_unconfirmed_ledger()
+                        except Exception as e:           # pragma: no cover - the assertion
+                            errors.append(("retrier", e))
+                            done.set()
+
+                t1 = threading.Thread(target=writer)
+                t2 = threading.Thread(target=retrier)
+                t1.start()
+                t2.start()
+                t1.join(60)
+                t2.join(60)
 
             self.assertEqual(errors, [], f"concurrent ledger access must never raise: {errors!r}")
+            self.assertEqual(len(writes), WRITES,
+                              "the inbound side must have really run — a writer that dies on its "
+                              "first key leaves nothing for the race to happen in")
+            self.assertGreater(len(seen_sizes), 0, "the retry side must have really run")
+            self.assertGreaterEqual(min(seen_sizes), SEED,
+                                     "the retrier must have been walking a non-empty failed set "
+                                     "on every pass, not an empty one")
+
+
+# --------------------------------------------------------------------------------------
+# 7 — the real `__init__` loads the ledger off disk (the call site, not just the function)
+# --------------------------------------------------------------------------------------
+@unittest.skipUnless(shutil.which("tmux"), "attach mode's constructor needs a live tmux session")
+class RealInitLoadsTheLedgerTests(unittest.TestCase):
+    """⛔ Every other test in this file hand-builds the bridge with `object.__new__`, so NONE of
+    them runs `__init__` — a mutation that gutted the ledger read out of the constructor left the
+    whole suite green, which is exactly the duplicate-delivery bug T-1047 exists to prevent.
+
+    This runs the real constructor. It needs two things from the environment: `HOME` (the ledger
+    path is `~/.config/agent2telegram/attach_sent.txt`, so a temporary HOME keeps the test off the
+    developer's own ledger) and an existing tmux session (attach mode refuses to construct
+    without one, by design).
+    """
+
+    def setUp(self):
+        self._home = tempfile.mkdtemp()
+        self._old_home = os.environ.get("HOME")
+        os.environ["HOME"] = self._home
+        self._session = f"a2t-test-{os.getpid()}"
+        subprocess.run(["tmux", "new-session", "-d", "-s", self._session, "sleep 300"],
+                       check=True, capture_output=True)
+        self.ledger = Path(self._home) / ".config" / "agent2telegram" / "attach_sent.txt"
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        subprocess.run(["tmux", "kill-session", "-t", self._session], capture_output=True)
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+        shutil.rmtree(self._home, ignore_errors=True)
+
+    def _real_bridge(self):
+        cfg = Config(agent="claude-code", token="1:2", allowed_user_ids=[7],
+                     tmux_session=self._session)
+        return AttachBridge(cfg, client=_FakeClient())
+
+    def test_a_fresh_process_loads_the_keys_an_earlier_one_confirmed(self):
+        self.ledger.write_text("k1\nk2\n", "utf-8")
+        b = self._real_bridge()
+        self.assertEqual(b._sent_path, self.ledger)
+        self.assertEqual(b._sent_keys, {"k1", "k2"},
+                          "a restarted process must remember what it already delivered — "
+                          "without this the same text goes out to the user a second time")
+        self.assertTrue(b._mark_sent("k1"),
+                         "a key loaded from a prior process must count as already delivered")
+
+    def test_a_missing_ledger_starts_empty_instead_of_crashing(self):
+        b = self._real_bridge()
+        self.assertEqual(b._sent_keys, set())
+
+    def test_an_undecodable_ledger_starts_empty_instead_of_crashing(self):
+        """A truncated/garbled ledger raises `UnicodeDecodeError` — a `ValueError`, NOT an
+        `OSError`. Catching only `OSError` meant the bridge refused to start at all after a
+        half-written file, which is strictly worse than losing the dedup memory."""
+        self.ledger.write_bytes(b"k1\n\xff\xfe not utf-8\n")
+        b = self._real_bridge()
+        self.assertEqual(b._sent_keys, set(),
+                          "an unreadable ledger must degrade to 'nothing confirmed yet', "
+                          "not stop the bridge from starting")
 
 
 if __name__ == "__main__":

@@ -324,10 +324,7 @@ class AttachBridge:
         # Persisted ledger of already-forwarded message uuids — survives restarts/crashes/reboots
         # so resuming an interrupted turn never re-sends what was already delivered.
         self._sent_path = Path.home() / ".config" / "agent2telegram" / "attach_sent.txt"
-        try:
-            self._sent_keys: set = set(self._sent_path.read_text("utf-8").split())
-        except OSError:
-            self._sent_keys = set()
+        self._sent_keys: set = self._load_sent_ledger()
         # TWO states, not one. `_sent_keys` = "Telegram confirmed this text" and it is what every
         # dedup check asks, so it must hold a key the moment the send succeeds. On disk is the
         # same thing MINUS `_unledgered`: the few keys whose write failed. Keeping the small set
@@ -764,6 +761,26 @@ class AttachBridge:
                               "cycle (%d id(s) unledgered)", e, len(unledgered))
                 return False
 
+    def _load_sent_ledger(self) -> set:
+        """Read the persisted ledger off `_sent_path`. The ONE implementation of that read —
+        `__init__` calls it at startup and the tests call it to model a restart, so there is no
+        second copy to drift from this one (an earlier copy in the tests meant a mutation that
+        gutted the startup read left the whole suite green).
+
+        A ledger that cannot be read is treated as empty: an unreadable ledger must never stop
+        the bridge from starting, it only costs dedup memory. ⛔ `OSError` alone is not enough —
+        a truncated/garbled file raises `UnicodeDecodeError` (a `ValueError`, not an `OSError`),
+        which used to crash startup instead of degrading to "nothing confirmed yet".
+        """
+        try:
+            return set(self._sent_path.read_text("utf-8").split())
+        except OSError:
+            return set()
+        except ValueError as e:        # UnicodeDecodeError — a corrupt/garbled ledger file
+            log.warning("could not decode the delivered-message ledger %s (%s) — starting with "
+                        "an empty one; already-delivered texts may be re-sent once", self._sent_path, e)
+            return set()
+
     def _unledgered(self) -> set:
         """Delivered ids whose ledger write failed. Lazily created: tests and `selftest` build a
         bridge by hand and set `_sent_keys` directly, and a missing attribute must not turn a
@@ -798,6 +815,12 @@ class AttachBridge:
         iteration` — and because this is the first statement of `_flush_pending`, that exception
         took down the WHOLE outbound cycle (drain, turn end, heartbeat) and delivered nothing.
         """
+        # ⛔ The `list()` snapshot is what the test suite actually proves: without it the loop
+        # mutates the set it is walking (`_mark_sent` discards the key it writes) and raises on
+        # the first key. The LOCK is not provable here — measured: removing it keeps the
+        # concurrency test green 8/8 even at a 1 µs switch interval, because `list(a_set)` is one
+        # C call that never releases the GIL. It stays for the free-threaded builds, where that
+        # is no longer true, and so the two paths into this set keep one door.
         with self._ledger_lock_held():
             for key in list(self._unledgered()):
                 if not self._mark_sent(key):
