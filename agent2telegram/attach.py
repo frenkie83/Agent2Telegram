@@ -328,6 +328,12 @@ class AttachBridge:
             self._sent_keys: set = set(self._sent_path.read_text("utf-8").split())
         except OSError:
             self._sent_keys = set()
+        # TWO states, not one. `_sent_keys` = "Telegram confirmed this text" and it is what every
+        # dedup check asks, so it must hold a key the moment the send succeeds. `_ledgered_keys`
+        # = "and the disk knows it too" — only that one may let a record leave the queue, because
+        # only that one survives a restart. At startup they are the same set (both come from the
+        # file); they diverge exactly when a ledger write fails.
+        self._ledgered_keys: set = set(self._sent_keys)
         # Durable outbound queue: a reply whose send HARD-fails (network reset, etc.) is persisted
         # here and re-sent by the outbound loop until Telegram confirms — so a turn's answer is
         # NEVER silently lost. Survives restarts (re-loaded below). Per-bridge (tmux slug).
@@ -710,23 +716,60 @@ class AttachBridge:
         only in memory. The caller then removed the record from the queue and after a restart the
         SAME reply was sent again — a duplicate at exactly the moment the disk is full. A review
         called the earlier write-order fix "only skin-deep"; it was right.
+
+        ⛔ "Already in memory" is NOT an answer to "is it on disk?". Returning True because
+        `_sent_keys` holds the key is what made the earlier fix skin-deep after all: the first
+        write failed (the record correctly stayed queued), and the NEXT cycle found the key in
+        memory and reported success without ever retrying the write — the record then left the
+        queue with an incomplete ledger, and after a restart the same text was sent again. With a
+        batched message that is one key per text, so the first can be on disk and the second not.
+        So the shortcut asks `_ledgered_keys`, and a key that is sent but unledgered RETRIES the
+        write on every call (and `_retry_unconfirmed_ledger` makes sure there is a next call).
         """
         if not uuid:
             return True
-        if uuid in self._sent_keys:
+        if uuid in self._ledger_confirmed():
             return True
-        self._sent_keys.add(uuid)
+        self._sent_keys.add(uuid)        # delivered — every dedup check must see it right away
         try:
             self._sent_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self._sent_path, "a", encoding="utf-8") as f:
                 f.write(uuid + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+            self._ledger_confirmed().add(uuid)
             return True
         except OSError as e:
             log.error("could not write the delivered-message ledger (%s) — keeping the record queued "
                       "so the reply is not sent twice", e)
             return False
+
+    def _ledger_confirmed(self) -> set:
+        """The ids this process has seen land on disk. Lazily created: tests and `selftest` build
+        a bridge by hand and set `_sent_keys` directly, and a missing attribute must not turn a
+        delivery path into an `AttributeError`."""
+        keys = getattr(self, "_ledgered_keys", None)
+        if keys is None:
+            keys = set()
+            self._ledgered_keys = keys
+        return keys
+
+    def _retry_unconfirmed_ledger(self) -> None:
+        """Re-write ledger entries whose disk write failed earlier. One place for ALL the paths.
+
+        Five call sites write the ledger (`_send_final`'s voice reply and its legacy direct send,
+        `_flush_pending`'s dead-letter branch, its main outbox branch and its legacy
+        `_pending_send` branch) and only the main outbox branch can hold its record back when the
+        write fails — the other four have already delivered, with no queue left to wait in. Their
+        key would stay sent-but-unledgered until a restart, and then the text would be re-sent.
+        Retrying here, from the outbound cycle, closes all five through one door: the write is
+        attempted again every tick until the disk takes it.
+        """
+        unconfirmed = [k for k in getattr(self, "_sent_keys", ()) or ()
+                       if k not in self._ledger_confirmed()]
+        for key in unconfirmed:
+            if not self._mark_sent(key):
+                return                   # still failing — the next cycle tries again
 
     # ---- inbound update persistence -----------------------------------------
     def _init_update_state(self) -> None:
@@ -1060,6 +1103,7 @@ class AttachBridge:
     def _flush_pending(self) -> None:
         """Deliver the queue FIFO, stopping at the first failure to preserve order. Called every
         outbound cycle, so a network hiccup self-heals within one tick."""
+        self._retry_unconfirmed_ledger()
         outbox = self._ensure_outbox()
         while outbox is not None and self._owner_chat is not None:
             rec = outbox.head()
