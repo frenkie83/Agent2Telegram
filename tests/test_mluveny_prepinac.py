@@ -18,7 +18,7 @@ from pathlib import Path
 
 from agent2telegram import stt
 from agent2telegram.attach import _normalize_spoken, _spoken_voice_switch
-from tests.test_v2_durability import _bridge, _msg
+from tests.test_v2_durability import _msg
 from tests.test_voice import _voice_bridge
 
 

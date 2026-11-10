@@ -19,7 +19,6 @@ Row 2 — end of turn from the transcript alone (`_transcript_turn_end_ready` / 
   10. `IDLE_DONE` is still reachable — the new branch did not displace it
 """
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -152,7 +151,7 @@ class JednaZpravaNaTahTests(unittest.TestCase):
             b2 = _regrese_bridge(td)
             b2._transcript = transcript
             b2._status_push = lambda *a, **k: None
-            b2._sent_keys = set(b2._sent_path.read_text("utf-8").split())
+            b2._sent_keys = b2._load_sent_ledger()   # the same read `__init__` does, not a copy of it
             self.assertEqual(len(b2._sent_keys), 2, "the ledger must carry BOTH texts' ids, not just one")
 
             # A new turn resumes mid-way: the transcript is re-read from the start of the current
