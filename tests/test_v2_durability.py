@@ -611,7 +611,7 @@ class OutboxCompletionOrderingTests(unittest.TestCase):
             outbox = b._ensure_outbox()
             record_id = outbox.enqueue(["reply only once"], [], "reply-1")
 
-            def crash_during_ledger(_key):
+            def crash_during_ledger(_key, *, queued=False):
                 raise SystemExit("crash while writing the sent ledger")
 
             b._mark_sent = crash_during_ledger
