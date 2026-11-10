@@ -428,5 +428,118 @@ class RealInitLoadsTheLedgerTests(unittest.TestCase):
                           "not stop the bridge from starting")
 
 
+# --------------------------------------------------------------------------------------
+# 8 — a PERMANENTLY unwritable ledger (not merely a `_FailAfter` patch) must not block the
+#     whole FIFO: this is the blocking review finding T-1047 exists to fix.
+# --------------------------------------------------------------------------------------
+class PermanentlyReadOnlyLedgerDoesNotBlockTheQueueTests(unittest.TestCase):
+    def test_three_queued_replies_all_get_delivered_despite_a_readonly_ledger_file(self):
+        """No `builtins.open` patch here on purpose — a real read-only file, so `chmod` alone
+        has to be what makes the write fail; a patch would not prove that. Before the fix only
+        the FIRST of the three texts ever reached the user: the ledger write for its key failed
+        and the record (being the FIFO head) was held forever, so the second and third replies
+        sat behind it untouched."""
+        self.addCleanup(logging.disable, logging.NOTSET)
+        logging.disable(logging.CRITICAL)
+        with tempfile.TemporaryDirectory() as td:
+            b = _bridge(td)
+            b._sent_path.write_text("", "utf-8")
+            os.chmod(b._sent_path, 0o444)
+            outbox = b._ensure_outbox()
+            outbox.enqueue(["one"], [], "k1")
+            outbox.enqueue(["two"], [], "k2")
+            outbox.enqueue(["three"], [], "k3")
+
+            try:
+                for _ in range(20):      # far more than the 3×3 cycles the bounded retry needs
+                    b._flush_pending()
+                    if outbox.head() is None:
+                        break
+            finally:
+                os.chmod(b._sent_path, 0o644)   # must heal before TemporaryDirectory cleans up
+
+            self.assertIsNone(outbox.head(), "the queue must drain even though the ledger never "
+                                              "accepts a single write")
+            texts = [msg for chat, msg in b.tg.sent if not msg.startswith("⚠️")]
+            self.assertEqual(texts, ["one", "two", "three"],
+                              "every queued reply must reach the user, not just the first one "
+                              "whose ledger write happened to fail")
+
+
+# --------------------------------------------------------------------------------------
+# 9 — a transient failure that heals before the retries run out: no release, no duplicate
+# --------------------------------------------------------------------------------------
+class TransientLedgerFailureHealsWithoutDuplicatingOrReleasingTests(unittest.TestCase):
+    def test_disk_healing_mid_retry_completes_the_record_and_sends_the_text_only_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            b = _bridge(td)
+            outbox = b._ensure_outbox()
+            outbox.enqueue(["hello"], [], "k1")
+
+            with _FailAfter(b._sent_path, fail_from=1):
+                for _ in range(OUTBOX_MAX_ATTEMPTS - 1):   # fewer cycles than the give-up bound
+                    b._flush_pending()
+                self.assertIsNotNone(outbox.head(),
+                                      "setup: a transient failure must still keep the record "
+                                      "queued while retries remain")
+
+            b._flush_pending()         # disk healed — this cycle must finish the record
+
+            self.assertIsNone(outbox.head(), "the record must complete once the ledger heals")
+            self.assertIn("k1", b._sent_path.read_text("utf-8").split())
+            self.assertEqual(b.tg.sent, [(7, "hello")],
+                              "healing before the retries are exhausted must not send the text "
+                              "a second time")
+
+
+# --------------------------------------------------------------------------------------
+# 10 — a stump left by an interrupted write must not glue onto the next append
+# --------------------------------------------------------------------------------------
+class SelfDelimitingLedgerWriteTests(unittest.TestCase):
+    def test_an_unterminated_stump_does_not_swallow_the_next_appended_key(self):
+        """Models a write cut off mid-line (e.g. `ENOSPC` after the id but before its `\\n`):
+        the file ends in "k2st" with no trailing newline. The next append must still produce a
+        separately-readable "k3", not a glued "k2stk3" that matches neither real id."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _bridge(td)
+            b._sent_path.write_text("k1\nk2st", "utf-8")   # stump, no trailing newline
+            b._sent_keys = b._load_sent_ledger()            # reload, as a restart would
+
+            self.assertTrue(b._mark_sent("k3"))
+
+            tokens = b._sent_path.read_text("utf-8").split()
+            self.assertIn("k3", tokens, "the new key must be its own token")
+            self.assertNotIn("k2stk3", tokens, "it must not have glued onto the stump")
+            reloaded = b._load_sent_ledger()
+            self.assertIn("k3", reloaded)
+
+
+# --------------------------------------------------------------------------------------
+# 11 — the retry path must not claim "nothing is holding it" about a key that a queued
+#      record DOES hold
+# --------------------------------------------------------------------------------------
+class RetryReportingDoesNotClaimNothingHoldsAQueuedKeyTests(unittest.TestCase):
+    def test_retry_of_a_queued_keys_write_never_logs_nothing_is_holding_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            b = _bridge(td)
+            outbox = b._ensure_outbox()
+            outbox.enqueue(["hello"], [], "k1")
+
+            with _FailAfter(b._sent_path, fail_from=1):
+                self.assertFalse(b._mark_sent_keys("k1", queued=True),
+                                  "setup: the write must fail so k1 ends up unledgered")
+                self.assertIn("k1", b._unledgered())
+
+                b._last_ledger_warning = 0.0    # don't let the throttle hide this call's line
+                with self.assertLogs("agent2telegram.attach", level="ERROR") as cm:
+                    b._retry_unconfirmed_ledger()
+
+            self.assertTrue(cm.output, "the retry must log something about the still-failing write")
+            for line in cm.output:
+                self.assertNotIn("nothing is holding it", line,
+                                  "k1 is the key of a record still sitting in the outbox queue — "
+                                  "the retry path does not know that and must not claim otherwise")
+
+
 if __name__ == "__main__":
     unittest.main()
