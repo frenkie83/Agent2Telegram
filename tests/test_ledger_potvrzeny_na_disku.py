@@ -627,6 +627,9 @@ class UnwritableQueueDirectoryPlusUnwritableLedgerTests(unittest.TestCase):
 # --------------------------------------------------------------------------------------
 # 13 — give-up on a permanently broken ledger must warn the owner ONCE, not once per record
 # --------------------------------------------------------------------------------------
+@unittest.skipIf(os.geteuid() == 0, "running as root defeats chmod — the write would "
+                                    "succeed, the ledger would never fail and no warning "
+                                    "would be produced at all")
 class GiveUpDoesNotFloodTheChatTests(unittest.TestCase):
     def test_ten_queued_replies_giving_up_on_the_ledger_produce_exactly_one_warning(self):
         """Ten replies queued behind a ledger that never heals: every one of them eventually
