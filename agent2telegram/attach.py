@@ -65,6 +65,17 @@ INBOUND_MAX_ATTEMPTS = 5
 # How many times an outgoing attachment is retried before giving up. Without a cap one bad
 # attachment would hold the head of the FIFO queue forever and block every later reply.
 OUTBOX_MAX_ATTEMPTS = 3
+#: A failing ledger write logs on every outbound tick from two call sites; full detail the first
+#: time, then at most one line per this many seconds (see `_ledger_warn`).
+LEDGER_WARN_EVERY = 60.0
+#: Ledger writes re-attempted per outbound tick. After a long disk outage the failed set holds
+#: thousands of keys and each write costs an `fsync`; a whole pass per tick would starve the loop
+#: of its heartbeat (see `_retry_unconfirmed_ledger`).
+LEDGER_RETRY_PER_TICK = 50
+#: Guards the lazy construction of the per-bridge ledger state (`_unledgered`,
+#: `_ledger_lock_held`) — see their docstrings. Module-level: it protects the creation of the
+#: per-bridge lock, so it cannot live on the bridge itself.
+_LEDGER_INIT_LOCK = threading.Lock()
 # How often a message left in durable storage is retried WHILE RUNNING. Without this it waited
 # for a restart — for a service running for weeks, effectively forever (review finding #1).
 INBOUND_RETRY_INTERVAL = 30.0
@@ -713,7 +724,7 @@ class AttachBridge:
                 ok = False
         return ok
 
-    def _mark_sent(self, uuid: str, *, queued: bool = False) -> bool:
+    def _mark_sent(self, uuid: str, *, queued: bool = False, retrying: bool = False) -> bool:
         """Record a delivered message uuid in memory and on disk. Returns whether the disk write
         succeeded.
 
@@ -741,25 +752,60 @@ class AttachBridge:
             try:
                 self._sent_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(self._sent_path, "a", encoding="utf-8") as f:
-                    f.write(uuid + "\n")
+                    # ⛔ LEADING newline too, so every append is self-delimiting. ENOSPC can stop
+                    # a write mid-line ("uui" with no "\n"); the next attempt would then glue
+                    # itself onto that stump and `split()` would read one nonexistent id instead
+                    # of the real one — the retry would look done and the text would go out twice
+                    # after a restart. A stray blank line costs nothing: `split()` drops it, and
+                    # a truncated stump stays a separate token that matches no real id.
+                    f.write("\n" + uuid + "\n")
                     f.flush()
                     os.fsync(f.fileno())
                 unledgered.discard(uuid)
                 return True
             except OSError as e:
                 unledgered.add(uuid)
-                if queued:
-                    log.error("could not write the delivered-message ledger (%s) — keeping the "
-                              "record queued so the reply is not sent twice", e)
+                if retrying:
+                    # ⛔ Says nothing about who holds the record, because this caller does not
+                    # know: `_retry_unconfirmed_ledger` walks bare keys, and the SAME key can
+                    # belong to a queued record (main outbox) or to none (voice/legacy paths).
+                    # Claiming either way would contradict the other branch's line about the very
+                    # same key, every tick (rule 1c).
+                    self._ledger_warn("the delivered-message ledger still refuses the write (%s) "
+                                      "— %d id(s) unledgered, retrying every outbound cycle",
+                                      e, len(unledgered))
+                elif queued:
+                    self._ledger_warn("could not write the delivered-message ledger (%s) — "
+                                      "keeping the record queued so the reply is not sent twice", e)
                 else:
                     # ⛔ NOT "kept queued": this path has already delivered and has no queue to
                     # wait in. Saying otherwise tells the operator the reply is safe when a
                     # restart before the disk heals will send it a second time (rule 1c).
-                    log.error("could not write the delivered-message ledger (%s) — the reply is "
-                              "ALREADY delivered and nothing is holding it, so a restart before "
-                              "the disk recovers will send it again; retrying every outbound "
-                              "cycle (%d id(s) unledgered)", e, len(unledgered))
+                    self._ledger_warn("could not write the delivered-message ledger (%s) — the "
+                                      "reply is ALREADY delivered and nothing is holding it, so a "
+                                      "restart before the disk recovers will send it again; "
+                                      "retrying every outbound cycle (%d id(s) unledgered)",
+                                      e, len(unledgered))
                 return False
+
+    def _ledger_warn(self, msg: str, *args) -> None:
+        """Log a failed ledger write — the FIRST one in full, then at most one per
+        `LEDGER_WARN_EVERY` seconds.
+
+        ⛔ Not cosmetic: the outbound loop ticks every `OUTBOUND_TICK` seconds and a failing write
+        logs on each tick from two call sites, so an unthrottled line is ~13/s, ~48k an hour, for
+        as long as the disk stays bad. The usual cause of a failed write is a FULL DISK — so the
+        flood lands on the very disk that is full, and journald's rate limit then drops other
+        processes' errors at exactly the moment of the incident. `_last_pane_warning` throttles
+        the owner-alert path for the same reason.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_ledger_warning", 0.0)
+        if last and now - last < LEDGER_WARN_EVERY:
+            log.debug(msg, *args)
+            return
+        self._last_ledger_warning = now
+        log.error(msg, *args)
 
     def _load_sent_ledger(self) -> set:
         """Read the persisted ledger off `_sent_path`. The ONE implementation of that read —
@@ -784,19 +830,28 @@ class AttachBridge:
     def _unledgered(self) -> set:
         """Delivered ids whose ledger write failed. Lazily created: tests and `selftest` build a
         bridge by hand and set `_sent_keys` directly, and a missing attribute must not turn a
-        delivery path into an `AttributeError`."""
-        keys = getattr(self, "_unledgered_keys", None)
-        if keys is None:
-            keys = set()
-            self._unledgered_keys = keys
-        return keys
+        delivery path into an `AttributeError`.
+
+        ⛔ Under `_LEDGER_INIT_LOCK`, because lazy is not the same as safe: two threads arriving
+        here together would each build their OWN set, one of them would be thrown away, and the
+        failed key recorded in it would never be retried. Same for the lock below — two threads,
+        two `RLock`s, no mutual exclusion at all. `__init__` builds both eagerly, so this only
+        ever fires for hand-built bridges (`selftest`, the tests) — which is exactly where the
+        concurrency test runs."""
+        with _LEDGER_INIT_LOCK:
+            keys = getattr(self, "_unledgered_keys", None)
+            if keys is None:
+                keys = set()
+                self._unledgered_keys = keys
+            return keys
 
     def _ledger_lock_held(self):
-        lock = getattr(self, "_ledger_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._ledger_lock = lock
-        return lock
+        with _LEDGER_INIT_LOCK:
+            lock = getattr(self, "_ledger_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                self._ledger_lock = lock
+            return lock
 
     def _retry_unconfirmed_ledger(self) -> None:
         """Re-write ledger entries whose disk write failed earlier. One place for ALL the paths.
@@ -815,16 +870,24 @@ class AttachBridge:
         iteration` — and because this is the first statement of `_flush_pending`, that exception
         took down the WHOLE outbound cycle (drain, turn end, heartbeat) and delivered nothing.
         """
-        # ⛔ The `list()` snapshot is what the test suite actually proves: without it the loop
-        # mutates the set it is walking (`_mark_sent` discards the key it writes) and raises on
-        # the first key. The LOCK is not provable here — measured: removing it keeps the
-        # concurrency test green 8/8 even at a 1 µs switch interval, because `list(a_set)` is one
-        # C call that never releases the GIL. It stays for the free-threaded builds, where that
-        # is no longer true, and so the two paths into this set keep one door.
+        # ⛔ The snapshot is what the test suite actually proves: without it the loop mutates the
+        # set it is walking (`_mark_sent` discards the key it writes) and raises on the first key.
+        # The LOCK is not provable here — measured: removing it keeps the concurrency test green
+        # 8/8 even at a 1 µs switch interval, because `list(a_set)` is one C call that never
+        # releases the GIL. It stays for the free-threaded builds, where that is no longer true,
+        # and so the two paths into this set keep one door.
+        #
+        # ⛔ The lock is held for the SNAPSHOT only, and the pass is capped. Each write costs an
+        # `fsync`; after a long outage the set holds thousands of keys, and writing them all under
+        # the lock would block the inbound thread in `_mark_sent_keys` for the whole pass and keep
+        # the tick from reaching its heartbeat — the watchdog would then restart the bridge
+        # mid-pass. `_mark_sent` takes the lock again per key, so each key is still written under
+        # it; what is given up is only the atomicity of the WHOLE pass, which nothing needs.
         with self._ledger_lock_held():
-            for key in list(self._unledgered()):
-                if not self._mark_sent(key):
-                    return               # still failing — the next cycle tries again
+            batch = list(self._unledgered())[:LEDGER_RETRY_PER_TICK]
+        for key in batch:
+            if not self._mark_sent(key, retrying=True):
+                return               # still failing — the next cycle tries again
 
     # ---- inbound update persistence -----------------------------------------
     def _init_update_state(self) -> None:
@@ -1210,7 +1273,23 @@ class AttachBridge:
             if rec.key and not self._mark_sent_keys(rec.key, queued=True):
                 # The ledger write failed → the record STAYS in the queue. Delivered parts are
                 # marked, so they are not resent; the next cycle just tries to finish it.
-                return
+                #
+                # ⛔ But BOUNDED, for exactly the reason the attachment branch above is bounded:
+                # this record is the HEAD of the FIFO, so holding it holds every later reply too.
+                # A ledger that refuses the write PERMANENTLY (root-owned file after one `sudo`
+                # run, read-only mount, a disk that never empties) would mean the agent keeps
+                # answering and the user never gets another message, with one log line as the
+                # only symptom. Measured on the first shape of this fix: 3 replies queued, 50
+                # cycles, exactly 1 delivered. Losing delivery outright is worse than the
+                # duplicate this ledger exists to prevent, so after the retries are spent the
+                # record is released and the owner is TOLD — never silently.
+                attempts = outbox.fail(rec.record_id, f"ledger write failed for {rec.key}")
+                if attempts < OUTBOX_MAX_ATTEMPTS:
+                    return
+                self._report_ledger_giveup(attempts)
+                log.error("the delivered-message ledger refused %s after %d attempts — releasing "
+                          "the record so the queue is not blocked; a restart before the ledger "
+                          "is writable again may repeat this reply", rec.key, attempts)
             outbox.done(rec.record_id)
             # The record id and a text preview are logged ON PURPOSE: on 2026-08-01 the user
             # received one reply twice and the log could not tell whether it was the same
@@ -2744,6 +2823,20 @@ class AttachBridge:
             self.tg.send_message(self._owner_chat, f"⚠️ Couldn't send {name}: {reason}")
         except Exception as e:
             log.warning("could not report the rejected attachment: %s", e)
+
+    def _report_ledger_giveup(self, attempts: int) -> None:
+        """Tell the owner that delivery continues but the dedup ledger is not recording it. A
+        silent drop would be worse than a visible error — and a clogged queue worse still (the
+        same reasoning as `_report_permanent_refusal`, which this mirrors)."""
+        try:
+            self.tg.send_message(
+                self._owner_chat,
+                "⚠️ Can't record deliveries on disk (tried "
+                f"{attempts}×). Replies keep coming, but if I restart before that is fixed, "
+                "the last one may arrive twice. Check the disk and "
+                "~/.config/agent2telegram/attach_sent.txt.")
+        except Exception as e:
+            log.warning("could not report the unwritable ledger: %s", e)
 
     def _flush_files(self) -> None:
         """Upload whatever the last reply asked for. Kept separate from the text path so a

@@ -40,7 +40,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from agent2telegram.attach import AttachBridge
+from agent2telegram.attach import OUTBOX_MAX_ATTEMPTS, AttachBridge
 from agent2telegram.config import Config
 
 
@@ -170,20 +170,28 @@ class SecondPassRetriesTheWriteTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------------------
-# 3 — a permanently broken disk never releases the record, however many cycles run
+# 3 — a disk that never recovers holds the record for the bounded retries, then RELEASES it
 # --------------------------------------------------------------------------------------
 class PermanentlyBrokenDiskTests(unittest.TestCase):
-    def test_record_stays_queued_across_many_cycles_of_a_disk_that_never_recovers(self):
+    """⛔ This class used to assert the opposite ("must NEVER release the record") and that was
+    the bug: the record is the HEAD of the FIFO, so holding it forever holds every later reply
+    too. Measured on that shape: three replies queued, fifty cycles, exactly one delivered — the
+    agent answers and the user never hears from it again. Bounded retries keep the guarantee that
+    matters (a transient failure never duplicates) and give up the one that cannot be kept."""
+
+    def test_the_record_is_held_while_the_retries_last(self):
         with tempfile.TemporaryDirectory() as td:
             b = _bridge(td)
             outbox = b._ensure_outbox()
             outbox.enqueue(["hello"], [], "k1 k2")
 
             with _FailAfter(b._sent_path, fail_from=1):   # every write to this path fails
-                for _ in range(5):
+                for _ in range(OUTBOX_MAX_ATTEMPTS - 1):
                     b._flush_pending()
 
-            self.assertIsNotNone(outbox.head(), "a disk that never recovers must never release the record")
+                self.assertIsNotNone(outbox.head(),
+                                      "a transient failure must keep the record queued — that is "
+                                      "what stops the reply being sent twice after a restart")
             self.assertEqual(b.tg.sent, [(7, "hello")],
                               "the chunk itself must be sent only once, not once per failed cycle")
             self.assertEqual(b._sent_path.read_text("utf-8") if b._sent_path.exists() else "", "",
