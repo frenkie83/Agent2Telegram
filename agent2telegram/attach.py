@@ -38,7 +38,7 @@ from . import readers
 from . import tts
 from .compat import AlreadyRunning, single_instance_lock
 from .config import Config, _state_dir
-from .durable import DurableInbox, DurableOutbox
+from .durable import DurableError, DurableInbox, DurableOutbox
 from .session import SessionError, TmuxSession
 from .telegram import TelegramClient, TelegramError, is_network_error, split_message
 
@@ -1343,7 +1343,24 @@ class AttachBridge:
                 log.error("the delivered-message ledger refused %s after %d attempts — releasing "
                           "the record so the queue is not blocked; a restart before the ledger "
                           "is writable again may repeat this reply", rec.key, attempts)
-            outbox.done(rec.record_id)
+            # ⛔ Releasing the record is itself a disk operation (`done()` unlinks the pending
+            # file, which needs write permission on its DIRECTORY) and the give-up branch above
+            # reaches it precisely when the disk is known to be refusing writes. An `OSError`
+            # here used to escape `_flush_pending` and take the whole outbound cycle with it
+            # (drain, turn end, heartbeat) on EVERY tick — the watchdog then restarts the bridge,
+            # and a restart with an unwritten key is the duplicate this ledger exists to prevent.
+            # Guarded on the ONE line both paths go through, not per branch (rule 8b). The record
+            # stays queued and the next tick tries again; its chunks are already confirmed, so
+            # nothing is re-sent. ⚠️ The queue's OTHER writes (`enqueue`, `mark_chunk_sent`,
+            # `mark_file_sent`, `give_up`, `_persist_queue`) are still unguarded — a pre-existing
+            # hole, measured on the base branch too, filed as T-1060.
+            try:
+                outbox.done(rec.record_id)
+            except (OSError, DurableError) as e:
+                self._ledger_warn("release", "could not release the delivered record %s from the "
+                                  "queue (%s) — the outbound cycle continues and the next tick "
+                                  "retries; nothing is re-sent", rec.record_id, e)
+                return
             self._ledger_attempt_counts().pop(rec.record_id, None)
             # The record id and a text preview are logged ON PURPOSE: on 2026-08-01 the user
             # received one reply twice and the log could not tell whether it was the same

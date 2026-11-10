@@ -433,6 +433,8 @@ class RealInitLoadsTheLedgerTests(unittest.TestCase):
 #     whole FIFO: this is the blocking review finding T-1047 exists to fix.
 # --------------------------------------------------------------------------------------
 class PermanentlyReadOnlyLedgerDoesNotBlockTheQueueTests(unittest.TestCase):
+    @unittest.skipIf(os.geteuid() == 0, "running as root defeats chmod — the write would "
+                                          "succeed and the test would pass for the wrong reason")
     def test_three_queued_replies_all_get_delivered_despite_a_readonly_ledger_file(self):
         """No `builtins.open` patch here on purpose — a real read-only file, so `chmod` alone
         has to be what makes the write fail; a patch would not prove that. Before the fix only
@@ -540,6 +542,123 @@ class RetryReportingDoesNotClaimNothingHoldsAQueuedKeyTests(unittest.TestCase):
                 self.assertNotIn("nothing is holding it", line,
                                   "k1 is the key of a record still sitting in the outbox queue — "
                                   "the retry path does not know that and must not claim otherwise")
+
+
+# --------------------------------------------------------------------------------------
+# 12 — the queue's own storage, not just the ledger file, can be unwritable too. The revised
+#      fix counts attempts IN MEMORY precisely so this does not need a disk write — verify a
+#      tick under BOTH conditions at once does not raise, while retries remain.
+# --------------------------------------------------------------------------------------
+@unittest.skipIf(os.geteuid() == 0, "running as root defeats chmod — the write would "
+                                      "succeed and the test would pass for the wrong reason")
+class UnwritableQueueDirectoryPlusUnwritableLedgerTests(unittest.TestCase):
+    def test_a_tick_does_not_raise_when_both_the_ledger_and_the_pending_directory_are_readonly(self):
+        """Before this fix, counting attempts via `outbox.fail(...)` meant every failed-ledger
+        tick ALSO tried to write the outbox's own record file — so once the pending directory
+        itself turned unwritable (the usual case: ENOSPC or a permission problem hits the whole
+        state tree, not just one file in it), that write raised and the exception escaped
+        `_flush_pending`, taking the whole outbound cycle with it. The fix counts in memory, so a
+        tick with no pending chunks left to confirm must not touch the pending directory at all.
+
+        The chunk is confirmed in a FIRST tick, while the pending directory is still writable
+        (`mark_chunk_sent` itself is unrelated to this fix and is not under test here) — then the
+        directory is made read-only and a SECOND tick, still below `OUTBOX_MAX_ATTEMPTS`, must
+        complete without raising."""
+        self.addCleanup(logging.disable, logging.NOTSET)
+        logging.disable(logging.CRITICAL)
+        with tempfile.TemporaryDirectory() as td:
+            b = _bridge(td)
+            outbox = b._ensure_outbox()
+            outbox.enqueue(["one"], [], "k1")
+            b._sent_path.write_text("", "utf-8")
+            os.chmod(b._sent_path, 0o444)
+
+            # Tick 1: pending directory still writable — the chunk gets confirmed, only the
+            # ledger write fails (attempt 1 of OUTBOX_MAX_ATTEMPTS).
+            b._flush_pending()
+            self.assertIsNotNone(outbox.head(), "setup: the ledger failure must keep it queued")
+
+            os.chmod(outbox.pending_directory, 0o555)
+            try:
+                # Tick 2 (attempt 2 of 3): below the give-up bound, so nothing here needs to
+                # write to the now-readonly pending directory — must not raise.
+                b._flush_pending()
+            finally:
+                os.chmod(outbox.pending_directory, 0o755)
+                os.chmod(b._sent_path, 0o644)
+
+            self.assertIsNotNone(outbox.head(), "still within the bounded retries — stays queued")
+            self.assertEqual(b.tg.sent, [(7, "one")],
+                              "the text must not be sent a second time while retrying the ledger")
+
+    def test_a_tick_that_gives_up_does_not_raise_when_the_pending_directory_stays_readonly(self):
+        """Same setup as above, carried past `OUTBOX_MAX_ATTEMPTS`: once the ledger write gives
+        up, releasing the record means `outbox.done()`, which unlinks the pending file — itself a
+        write to the very directory this test keeps read-only. That release is expected to KEEP
+        FAILING (releasing it is impossible without write access; tracked separately as T-1060),
+        but the failure must not escape `_flush_pending` — the outbound cycle (drain, turn end,
+        heartbeat) must survive every tick regardless."""
+        self.addCleanup(logging.disable, logging.NOTSET)
+        logging.disable(logging.CRITICAL)
+        with tempfile.TemporaryDirectory() as td:
+            b = _bridge(td)
+            outbox = b._ensure_outbox()
+            outbox.enqueue(["one"], [], "k1")
+            b._sent_path.write_text("", "utf-8")
+            os.chmod(b._sent_path, 0o444)
+
+            b._flush_pending()   # pending directory still writable: chunk confirmed (attempt 1)
+
+            os.chmod(outbox.pending_directory, 0o555)
+            try:
+                for _ in range(OUTBOX_MAX_ATTEMPTS + 2):   # carries well past the give-up bound
+                    b._flush_pending()   # must never raise, even on the tick that gives up
+            finally:
+                os.chmod(outbox.pending_directory, 0o755)
+                os.chmod(b._sent_path, 0o644)
+
+            self.assertIsNotNone(outbox.head(), "releasing it needs a write the directory still "
+                                                  "refuses — it stays queued, not lost (T-1060)")
+            texts = [msg for chat, msg in b.tg.sent if not msg.startswith("⚠️")]
+            self.assertEqual(texts, ["one"],
+                              "the text must not be sent a second time across any of these ticks")
+
+
+# --------------------------------------------------------------------------------------
+# 13 — give-up on a permanently broken ledger must warn the owner ONCE, not once per record
+# --------------------------------------------------------------------------------------
+class GiveUpDoesNotFloodTheChatTests(unittest.TestCase):
+    def test_ten_queued_replies_giving_up_on_the_ledger_produce_exactly_one_warning(self):
+        """Ten replies queued behind a ledger that never heals: every one of them eventually
+        gives up and is released (so none is lost), but the owner-facing warning
+        (`_report_ledger_giveup`) must fire once, not once per released record — the throttle is
+        `_ledger_warn_due("giveup-report")`, shared across all ten give-ups."""
+        self.addCleanup(logging.disable, logging.NOTSET)
+        logging.disable(logging.CRITICAL)
+        with tempfile.TemporaryDirectory() as td:
+            b = _bridge(td)
+            outbox = b._ensure_outbox()
+            for i in range(10):
+                outbox.enqueue([f"text{i}"], [], f"k{i}")
+            b._sent_path.write_text("", "utf-8")
+            os.chmod(b._sent_path, 0o444)
+            try:
+                for _ in range(60):      # far more ticks than 10 records * OUTBOX_MAX_ATTEMPTS need
+                    b._flush_pending()
+                    if outbox.head() is None:
+                        break
+            finally:
+                os.chmod(b._sent_path, 0o644)
+
+            self.assertIsNone(outbox.head(), "every record must eventually be released, "
+                                              "not held forever by an unhealable ledger")
+            texts = [msg for chat, msg in b.tg.sent if not msg.startswith("⚠️")]
+            warnings = [msg for chat, msg in b.tg.sent if msg.startswith("⚠️")]
+            self.assertEqual(texts, [f"text{i}" for i in range(10)],
+                              "every queued reply must still reach the user")
+            self.assertEqual(len(warnings), 1,
+                              "ten give-ups within the throttle window must produce ONE warning, "
+                              "not one per released record")
 
 
 if __name__ == "__main__":
