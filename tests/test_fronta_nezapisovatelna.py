@@ -16,7 +16,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from agent2telegram.attach import AttachBridge
+from agent2telegram.attach import OUTBOX_MAX_ATTEMPTS, AttachBridge
 from tests.test_ledger_potvrzeny_na_disku import _bridge
 
 
@@ -79,7 +79,12 @@ class UnwritableQueueDirectoryTests(unittest.TestCase):
     def test_an_attachment_that_keeps_failing_does_not_raise_or_repeat_its_report(self):
         with tempfile.TemporaryDirectory() as td:
             b = _loop_bridge(td)
-            b._send_one_file = lambda p: (_ for _ in ()).throw(RuntimeError("HTTP 400"))
+            uploads = [0]
+
+            def _fail_upload(p):
+                uploads[0] += 1
+                raise RuntimeError("HTTP 400")
+            b._send_one_file = _fail_upload
             outbox = b._ensure_outbox()
             outbox.enqueue([], [str(Path(td) / "gone.bin")], "kf")
             os.chmod(outbox.pending_directory, 0o555)
@@ -90,6 +95,9 @@ class UnwritableQueueDirectoryTests(unittest.TestCase):
                 os.chmod(outbox.pending_directory, 0o755)
             self.assertLessEqual(len(b.tg.sent), 1,
                                  "the permanent-refusal notice must not go out once per tick")
+            self.assertLessEqual(uploads[0], OUTBOX_MAX_ATTEMPTS,
+                                 "an attachment must not be uploaded again every tick once its "
+                                 "attempts are spent and only the dead-letter move is refused")
 
 
 class _FlakyClient:

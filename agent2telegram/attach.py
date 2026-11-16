@@ -1280,6 +1280,15 @@ class AttachBridge:
                               "outbound cycle continues and the next tick retries", what, e)
             return False, None
 
+    def _file_giveups(self) -> dict:
+        """Records whose attachment attempts are spent but whose dead-letter move was refused."""
+        with _LEDGER_INIT_LOCK:
+            d = getattr(self, "_queue_file_giveups", None)
+            if d is None:
+                d = {}
+                self._queue_file_giveups = d
+            return d
+
     def _queue_memory(self) -> dict:
         """Per record: what Telegram confirmed but the queue could not record yet, as an ordered
         list of `("c", index)` / `("f", path)`. In memory ONLY, on purpose — see `_flush_pending`."""
@@ -1352,21 +1361,30 @@ class AttachBridge:
             for file_path in rec.pending_files:
                 if file_path in held_files:
                     continue
+                spent = self._file_giveups()
                 try:
+                    if rec.record_id in spent:
+                        # Attempts are used up and only the dead-letter move was refused: do NOT
+                        # upload again every tick (flood control for the whole bot) — just retry it.
+                        raise RuntimeError(spent[rec.record_id])
                     self._send_one_file(file_path)
                 except Exception as e:
                     # Bounded retries: without them one bad attachment (over the size limit,
                     # a deleted file, HTTP 400) would hold the head of the FIFO queue forever
                     # and NO further reply would reach the user (finding F2).
-                    ok, attempts = self._queue_write("fail", outbox.fail, rec.record_id,
-                                                     f"{file_path}: {e}")
-                    if not ok:
-                        # `fail` is a disk write too; count in memory, same as the ledger below.
-                        tries = self._ledger_attempt_counts()
-                        attempts = tries.get(("file", rec.record_id), 0) + 1
-                        tries[("file", rec.record_id)] = attempts
-                    log.warning("delivery of attachment %s failed (%d/%d): %s",
-                                file_path, attempts, OUTBOX_MAX_ATTEMPTS, e)
+                    if rec.record_id in spent:
+                        attempts = OUTBOX_MAX_ATTEMPTS
+                    else:
+                        ok, attempts = self._queue_write("fail", outbox.fail, rec.record_id,
+                                                         f"{file_path}: {e}")
+                        if not ok:
+                            # `fail` is a disk write too; count in memory, same as the ledger below.
+                            tries = self._ledger_attempt_counts()
+                            attempts = tries.get(("file", rec.record_id), 0) + 1
+                            tries[("file", rec.record_id)] = attempts
+                        self._ledger_warn("attachment-" + rec.record_id,
+                                          "delivery of attachment %s failed (%d/%d): %s",
+                                          file_path, attempts, OUTBOX_MAX_ATTEMPTS, e)
                     if attempts >= OUTBOX_MAX_ATTEMPTS:
                         # mark_file_sent must NOT be used: it would record that the attachment
                         # arrived when it did not — a silent loss, exactly what this project
@@ -1380,7 +1398,9 @@ class AttachBridge:
                         ok, _ = self._queue_write("give-up", outbox.give_up, rec.record_id,
                                                   f"attachment {file_path}: {e}")
                         if not ok:
+                            spent[rec.record_id] = str(e)
                             return
+                        spent.pop(rec.record_id, None)
                         self._ledger_attempt_counts().pop(("file", rec.record_id), None)
                         self._queue_memory().pop(rec.record_id, None)
                         self._report_permanent_refusal(Path(file_path).name, str(e))
@@ -1446,9 +1466,9 @@ class AttachBridge:
             # and a restart with an unwritten key is the duplicate this ledger exists to prevent.
             # Guarded on the ONE line both paths go through, not per branch (rule 8b). The record
             # stays queued and the next tick tries again; its chunks are already confirmed, so
-            # nothing is re-sent. Since T-1060 the queue's other writes go through the same door
-            # (`_queue_write`); `done` stays on its own line only because its failure ends THIS
-            # record's pass, and it forgets the in-memory bookkeeping when it finally works.
+            # nothing is re-sent. Since T-1060 the write calls of THIS function go through the same door
+            # (`_queue_write`). ⚠️ Not through it: `enqueue` in `_send_final` (own `except`,
+            # throttled log) and `_persist_queue` (swallows `OSError` silently, legacy list only).
             if not self._record_confirmed(outbox, rec.record_id):
                 return        # `done` would refuse a record whose confirmations are not on disk
             ok, _ = self._queue_write("release", outbox.done, rec.record_id)
