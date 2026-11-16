@@ -1162,7 +1162,9 @@ class AttachBridge:
         # Voice-reply mode: speak the reply as a Telegram voice note. Best-effort ENHANCEMENT —
         # a too-long reply or ANY failure falls straight through to the durable TEXT path below,
         # so voice mode can NEVER make a reply not arrive (that is the whole point of v2).
-        if (turn_text and text and self._voice_reply_on()
+        # (the voice note is a direct send too: skipped while older replies wait, the text path
+        # below then queues the reply in order)
+        if (turn_text and text and self._voice_reply_on() and not self._queues_busy()
                 and not (self.cfg.file_marker and self.cfg.file_marker.lower() in text.lower())):
             if len(text) > VOICE_MAX_CHARS:
                 text = f"{text}\n\n🗣️→📝 (too long to read aloud — sent as text)"
@@ -1221,7 +1223,10 @@ class AttachBridge:
                     self._turn_text_sent = True
                 return
 
-        if self._pending_send:                       # something already waiting → keep FIFO order
+        # ⛔ RULE (T-1060): nothing is sent directly while ANYTHING older waits — a durable record
+        # that still has something to send, or the legacy list. The new text goes behind it into
+        # `_pending_send`, which `_flush_pending` drains right after the durable queue.
+        if self._queues_busy():
             self._enqueue(text, key, turn_text=turn_text)
             return
         try:
@@ -1493,10 +1498,13 @@ class AttachBridge:
             # (`_queue_write`). ⚠️ Not through it: `enqueue` in `_send_final` (own `except`,
             # throttled log) and `_persist_queue` (swallows `OSError` silently, legacy list only).
             if not self._record_confirmed(outbox, rec.record_id):
-                return        # `done` would refuse a record whose confirmations are not on disk
+                # `done` would refuse a record whose confirmations are not on disk. Everything of
+                # this record HAS been delivered, so what is behind it may go out (`break`, not
+                # `return`: FIFO is kept, and the legacy list must not wait out the whole outage).
+                break
             ok, _ = self._queue_write("release", outbox.done, rec.record_id)
             if not ok:
-                return
+                break
             self._ledger_attempt_counts().pop(rec.record_id, None)
             self._ledger_attempt_counts().pop(("file", rec.record_id), None)
             self._queue_memory().pop(rec.record_id, None)

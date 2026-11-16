@@ -257,8 +257,8 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
             self.assertEqual(uploaded, ["/outbox/report.pdf"], "uploaded once, not again")
 
     def test_held_attachment_goes_out_after_its_text_and_after_older_queued_replies(self):
-        """Codex 1: held attachments are FIFO-last — behind the older durable record and behind
-        the text of their own reply."""
+        """Codex: the new reply goes BEHIND the older queued one (old < new < file) — nothing is
+        sent directly while anything older waits."""
         with tempfile.TemporaryDirectory() as td:
             b = _loop_bridge(td)
             outbox = b._ensure_outbox()
@@ -269,17 +269,13 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
             b._pending_files = ["/outbox/a.pdf"]
             os.chmod(outbox.pending_directory, 0o555)
             try:
-                b._send_final("new", "k-new")            # enqueue refused → old path
-                self.assertNotIn(("file", "/outbox/a.pdf"), events,
-                                 "an older reply is still queued — the file must wait")
+                b._send_final("new", "k-new")            # enqueue refused → legacy list
+                self.assertEqual(events, [], "an older reply waits — nothing goes out directly")
             finally:
                 os.chmod(outbox.pending_directory, 0o755)
-            b._flush_pending()
-            b._flush_pending()
-            kinds = [e for e in events]
-            self.assertEqual(kinds.count(("file", "/outbox/a.pdf")), 1)
-            self.assertLess(kinds.index(("text", "new")), kinds.index(("file", "/outbox/a.pdf")))
-            self.assertLess(kinds.index(("text", "old")), kinds.index(("file", "/outbox/a.pdf")))
+            for _ in range(3):
+                b._flush_pending()
+            self.assertEqual(events, [("text", "old"), ("text", "new"), ("file", "/outbox/a.pdf")])
 
     def test_a_failing_refusal_report_does_not_put_the_attachment_back_in_circulation(self):
         """Codex 2: the entry leaves the list BEFORE the owner is told."""
@@ -304,9 +300,10 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
             self.assertEqual(uploads[0], OUTBOX_MAX_ATTEMPTS)
             self.assertEqual(b._unsent_files(), [])
 
-    def test_held_attachment_is_not_stuck_behind_a_head_that_only_waits_for_its_confirmation(self):
+    def test_nothing_is_stuck_behind_a_head_that_only_waits_for_its_confirmation(self):
         """Review: with the disk STILL read-only, the older record's text goes out but its
-        confirmation cannot be written — it must not hold the attachment (memory-only) forever."""
+        confirmation cannot be written — neither the next text nor the attachment (both memory
+        only) may wait for it, and the order stays old < new < file."""
         with tempfile.TemporaryDirectory() as td:
             b = _loop_bridge(td)
             outbox = b._ensure_outbox()
@@ -322,9 +319,7 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
                     b._flush_pending()                    # the disk never heals here
             finally:
                 os.chmod(outbox.pending_directory, 0o755)
-            self.assertEqual(events.count(("file", "/outbox/a.pdf")), 1)
-            self.assertLess(events.index(("text", "old")), events.index(("file", "/outbox/a.pdf")))
-            self.assertEqual(events.count(("text", "old")), 1, "and the old text is not re-sent")
+            self.assertEqual(events, [("text", "old"), ("text", "new"), ("file", "/outbox/a.pdf")])
 
 
 if __name__ == "__main__":
