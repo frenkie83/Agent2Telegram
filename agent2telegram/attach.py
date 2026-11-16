@@ -1334,6 +1334,7 @@ class AttachBridge:
             held = self._queue_memory().get(rec.record_id, [])
             held_chunks = {w for k, w in held if k == "c"}
             held_files = {w for k, w in held if k == "f"}
+            sent_now: set = set()    # parts Telegram confirmed in THIS pass (`rec` is a stale copy)
             # Parts already confirmed by Telegram are NOT resent — only the remaining ones.
             for index, chunk in rec.pending_chunks:
                 if index in held_chunks:
@@ -1343,6 +1344,7 @@ class AttachBridge:
                 except Exception as e:
                     log.warning("delivery of part %d still failing: %s", index, e)
                     return
+                sent_now.add(index)
                 ok, _ = self._queue_write("confirm", outbox.mark_chunk_sent, rec.record_id, index)
                 if not ok:
                     self._queue_memory().setdefault(rec.record_id, []).append(("c", index))
@@ -1396,7 +1398,9 @@ class AttachBridge:
                 # the ledger, or a restart re-reads those texts and sends them again. With a
                 # batched message that is N texts, not one. Only when every chunk is confirmed:
                 # an unfinished text must stay re-sendable.
-                if rec.key and not rec.pending_chunks:
+                # `rec` is the copy read before this pass: parts confirmed since (or only in memory,
+                # because the queue refused to record them) still show as pending there.
+                if rec.key and all(i in sent_now or i in held_chunks for i, _ in rec.pending_chunks):
                     self._mark_sent_keys(rec.key)
                 continue          # the record is in dead-letter, the queue moves on
             if rec.key and not self._mark_sent_keys(rec.key, queued=True):
