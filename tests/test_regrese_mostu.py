@@ -1,7 +1,8 @@
 """Regression tests measuring the three vadas our fork used to carry against UPSTREAM behaviour.
 
 Our fork had its own tests/test_queued_message.py (875 lines) that fixed the same three findings
-a different way. That file is gone now that the repository is back on upstream — it also broke
+a different way. That file was gone while the repository was on upstream (T-1043 brought it
+back with the integration branch) — it also broke
 against upstream for the wrong reason: it built `cfg` as a bare `types.SimpleNamespace`, which is
 missing fields upstream reads (e.g. `file_marker`), so 19 of 25 failures were the harness, not a
 real defect.
@@ -275,7 +276,7 @@ class QueuedMidTurnMessageGetsAnAnswerTests(unittest.TestCase):
                 "shows the turn as answered, but the user saw nothing",
             )
             # NOT re-asserting `b._turn_from_tg` here on purpose: `ClaudeCodeReader.parse()`
-            # yields NOTHING at all for queue-operation and attachment records (see
+            # yields NOTHING for queue-operation and housekeeping records (see
             # `test_queue_bookkeeping_and_housekeeping_records_carry_no_reader_event` below), so
             # draining them can never touch `_turn_from_tg` either way — an assert repeating the
             # one above would look like it measured that, and would never be able to fail.
@@ -283,8 +284,8 @@ class QueuedMidTurnMessageGetsAnAnswerTests(unittest.TestCase):
     def test_queue_bookkeeping_and_housekeeping_records_carry_no_reader_event(self):
         """Why the assert above doesn't need to (and can't usefully) re-check `_turn_from_tg`
         after draining queue/housekeeping records: `ClaudeCodeReader.parse()` produces NO event
-        at all for `type: "queue-operation"` or `type: "attachment"` records — its `parse()`
-        only recognises `type: "user"` and `type: "assistant"`. This is not incidental, it is the
+        for `type: "queue-operation"` or housekeeping records (T-1043: only a `queued_command`
+        attachment yields one, a `queued` user event that can only ADD origin). This is not incidental, it is the
         actual reason the fix stamps Telegram origin at injection time (`_begin_turn()`) instead
         of deriving it from the transcript: for a queued message there is structurally nothing in
         the transcript for a reader to derive it FROM."""

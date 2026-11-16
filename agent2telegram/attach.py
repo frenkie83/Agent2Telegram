@@ -653,7 +653,7 @@ class AttachBridge:
             pos = line_end
             try:
                 rec = json.loads(raw.decode("utf-8", "ignore"))
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 continue
             # Ask the reader (one definition of "a user message", shared with the live path).
             for ev in self._events(rec, "on resume"):
@@ -2777,8 +2777,9 @@ class AttachBridge:
             self._turn_active.clear()
         # A turn's Telegram origin DIES WITH AN ENDED TURN. Leaving it raised was not cosmetic: a
         # message typed into the tmux pane while a turn is finishing gets QUEUED by Claude Code
-        # and lands in the transcript only as `attachment`/`queued_command`, which the reader
-        # ignores — so no `user` record ever arrives to lower the flag, and the whole output of
+        # and lands in the transcript only as `attachment`/`queued_command` — which the reader
+        # reports as a `queued` user event that can only RAISE the origin — so no `user` record
+        # ever arrives to lower the flag, and the whole output of
         # that purely local turn is forwarded to Telegram. Not a lost reply this time but the
         # reverse: terminal session content leaking into the chat.
         #
@@ -2987,7 +2988,7 @@ class AttachBridge:
                 continue
             try:
                 rec = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError, RecursionError):   # one bad line must not eat the chunk
                 continue
             # A tool RESULT yields no event at all (it is not a prompt), so the signal has to be
             # dropped from the record itself — otherwise an "end_turn" seen BEFORE an outstanding
