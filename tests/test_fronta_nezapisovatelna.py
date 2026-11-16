@@ -256,6 +256,54 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
             b._flush_pending()
             self.assertEqual(uploaded, ["/outbox/report.pdf"], "uploaded once, not again")
 
+    def test_held_attachment_goes_out_after_its_text_and_after_older_queued_replies(self):
+        """Codex 1: held attachments are FIFO-last — behind the older durable record and behind
+        the text of their own reply."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _loop_bridge(td)
+            outbox = b._ensure_outbox()
+            events = []
+            b.tg.send_message = lambda chat, text, parse_mode=None: events.append(("text", text))
+            b._send_one_file = lambda p: events.append(("file", p))
+            outbox.enqueue(["old"], [], "k-old")
+            b._pending_files = ["/outbox/a.pdf"]
+            os.chmod(outbox.pending_directory, 0o555)
+            try:
+                b._send_final("new", "k-new")            # enqueue refused → old path
+                self.assertNotIn(("file", "/outbox/a.pdf"), events,
+                                 "an older reply is still queued — the file must wait")
+            finally:
+                os.chmod(outbox.pending_directory, 0o755)
+            b._flush_pending()
+            b._flush_pending()
+            kinds = [e for e in events]
+            self.assertEqual(kinds.count(("file", "/outbox/a.pdf")), 1)
+            self.assertLess(kinds.index(("text", "new")), kinds.index(("file", "/outbox/a.pdf")))
+            self.assertLess(kinds.index(("text", "old")), kinds.index(("file", "/outbox/a.pdf")))
+
+    def test_a_failing_refusal_report_does_not_put_the_attachment_back_in_circulation(self):
+        """Codex 2: the entry leaves the list BEFORE the owner is told."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _loop_bridge(td)
+            uploads = [0]
+
+            def _fail_upload(p):
+                uploads[0] += 1
+                raise RuntimeError("HTTP 500")
+            b._send_one_file = _fail_upload
+
+            def _report_boom(name, reason):
+                raise RuntimeError("telegram down")
+            b._report_permanent_refusal = _report_boom
+            b._unsent_files().append(["/outbox/a.pdf", 0])
+            for _ in range(OUTBOX_MAX_ATTEMPTS + 3):
+                try:
+                    b._flush_unsent_files()
+                except RuntimeError:
+                    pass                                  # the report itself may blow up
+            self.assertEqual(uploads[0], OUTBOX_MAX_ATTEMPTS)
+            self.assertEqual(b._unsent_files(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

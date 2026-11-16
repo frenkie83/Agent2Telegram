@@ -1209,9 +1209,10 @@ class AttachBridge:
                     self._unsent_files().extend([p, 0] for p in held)
                     if turn_text:
                         self._turn_text_sent = True      # handled, like a durably stored reply
-                    self._flush_unsent_files()
                 if not text:
-                    return          # attachment-only reply: no empty text to send or to queue
+                    # attachment-only reply: no empty text to send or to queue
+                    self._flush_unsent_files()
+                    return
             else:
                 self._pending_files = []
                 if turn_text:
@@ -1235,6 +1236,7 @@ class AttachBridge:
             self._turn_text_sent = True
         log.info("FWD (send, legacy path) %r", text[:40].replace("\n", " "))
         self._flush_files()
+        self._flush_unsent_files()        # text first, then the attachments the queue refused
 
     def _ensure_outbox(self) -> "DurableOutbox | None":
         # Attach mode only. StreamBridge shares this code but has its own queue alongside the
@@ -1328,11 +1330,16 @@ class AttachBridge:
     def _flush_pending(self) -> None:
         """Deliver the queue FIFO, stopping at the first failure to preserve order. Called every
         outbound cycle, so a network hiccup self-heals within one tick."""
-        self._retry_unconfirmed_ledger()
         try:
-            self._flush_unsent_files()     # attachments the queue refused (T-1096)
-        except Exception as e:             # must not end the tick
-            self._ledger_warn("unsent-file", "could not retry held attachments: %s", e)
+            self._flush_queues()
+        finally:
+            try:
+                self._flush_unsent_files()     # attachments the queue refused (T-1096), LAST
+            except Exception as e:             # must not end the tick
+                self._ledger_warn("unsent-file", "could not retry held attachments: %s", e)
+
+    def _flush_queues(self) -> None:
+        self._retry_unconfirmed_ledger()
         outbox = self._ensure_outbox()
         # ⛔ T-1060: EVERY write below goes through `_queue_write` and the loop never raises for a
         # disk that refuses it. When the queue cannot record a confirmation, Telegram HAS already
@@ -3062,10 +3069,22 @@ class AttachBridge:
                 self._unsent_file_list = held
             return held
 
+    def _queues_busy(self) -> bool:
+        """Is anything older still waiting — the legacy list or a durable record (or unreadable)?"""
+        if self._pending_send:
+            return True
+        outbox = getattr(self, "_outbox", None)
+        if outbox is None:
+            return False
+        ok, rec = self._queue_write("read", outbox.head)
+        return (not ok) or rec is not None
+
     def _flush_unsent_files(self) -> None:
         """Upload the held attachments in order; a path leaves the list only after a confirmed
         upload or, once `OUTBOX_MAX_ATTEMPTS` uploads failed, after the owner was told."""
         held = self._unsent_files()
+        if held and self._queues_busy():
+            return        # FIFO: older replies (and this reply's text) go out first
         while held and self._owner_chat is not None:
             entry = held[0]
             try:
@@ -3076,7 +3095,10 @@ class AttachBridge:
                     self._ledger_warn("unsent-file", "held attachment %s not uploaded (%d/%d): %s",
                                       entry[0], entry[1], OUTBOX_MAX_ATTEMPTS, e)
                     return
+                # ⛔ Out of the list FIRST: a failing report must not put it back in circulation.
+                held.pop(0)
                 self._report_permanent_refusal(Path(entry[0]).name, str(e))
+                continue
             held.pop(0)
 
     def _flush_files(self) -> None:
