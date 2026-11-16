@@ -18,3 +18,7 @@ config.json
 *.swp
 .idea/
 .vscode/
+
+# Raw agent/review run logs — working artefacts, never part of the project.
+_*.log
+.pytest_cache/

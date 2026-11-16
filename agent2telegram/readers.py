@@ -17,6 +17,12 @@ on-disk transcript format of one agent and maps its records to a common set of e
                    the call id (so the same call isn't pushed twice).
   ``turn_end``   — the turn finished. Codex writes ``task_complete`` (so no Stop hook is needed!);
                    Claude Code has none, so the bridge ends the turn via its Stop-hook marker / idle.
+  ``assistant_done`` — Claude Code only: THIS record is an assistant message that ended its turn
+                   (``stop_reason: "end_turn"`` — no tool call pending). It is a statement about
+                   one record, not about the turn: the bridge only knows the turn ended if no
+                   further record follows (see ``AttachBridge._transcript_turn_end_ready``). It is
+                   emitted LAST within its record, after the text and tool events, so a record
+                   that does call a tool cancels it by the events' own order.
 
 Why an abstraction instead of an ``if agent == ...`` in the bridge: the two formats differ a lot
 (Claude = one assistant record with text+tool_use blocks and a uuid; Codex = separate event_msg /
@@ -27,6 +33,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from collections import deque
 import os
 import urllib.parse
 from dataclasses import dataclass
@@ -34,11 +42,12 @@ from dataclasses import dataclass
 
 @dataclass
 class Ev:
-    kind: str               # turn_start | user | text | tool | turn_end
+    kind: str               # turn_start | user | text | tool | files | turn_end | assistant_done
     text: str = ""          # message / tool-summary text
     key: str = ""           # stable dedup id (text uuid/hash, tool call id)
     final: bool = False      # for 'text': hint that this is the final answer
     queued: bool = False     # for 'user': typed INTO a turn already running (joins it, doesn't start it)
+    files: tuple = ()        # for 'files': paths the agent wants delivered to the user
 
 
 def _short(s: str, n: int = 58) -> str:
@@ -86,6 +95,29 @@ def _text_of(content) -> str:
     return ""
 
 
+
+#: Tools by which an agent hands a FILE to the user. The harness runs them itself, so the bridge
+#: never sees a call — only its record in the transcript. Without this the file silently vanishes:
+#: the reply arrives, the attachment does not, and nothing anywhere says so (2026-08-24).
+#: Recognising the tool by name is deliberate — it beats guessing from prose, which would be
+#: language-dependent and full of false positives.
+FILE_SEND_TOOLS = {"senduserfile"}
+
+
+def _file_tool_paths(name: str, inp) -> tuple:
+    """Paths a file-sending tool call asks to deliver, or () when it is not such a call."""
+    if str(name or "").strip().lower() not in FILE_SEND_TOOLS:
+        return ()
+    if not isinstance(inp, dict):
+        return ()
+    raw = inp.get("files") or inp.get("file") or inp.get("paths") or inp.get("path")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return ()
+    return tuple(p for p in raw if isinstance(p, str) and p.strip())
+
+
 class ClaudeCodeReader:
     """Claude Code transcript (one JSONL record per message; assistant records carry text and
     tool_use blocks; user records may be real messages or tool results). No turn boundaries in
@@ -94,9 +126,138 @@ class ClaudeCodeReader:
     name = "claude-code"
     emits_turn_end = False
 
+    _CALL_LIMIT = 4096
+
+    # ⛔ On the CLASS, not on the instance. `AttachBridge._reader_unchanged` protects reader state
+    # during a read-only tail scan by `deepcopy`ing `vars(reader)`, and a lock in there makes the
+    # whole snapshot fail — it only logs a warning, so the protection would silently stop working
+    # and the symptom would be a shifted dedup window, not a red test. Sharing one lock between
+    # reader instances costs nothing: it is held for a few dict operations and never nested.
+    # What it does NOT claim: that the bridge drains from several threads. Today every path into
+    # `_drain_transcript` / `_last_assistant_text` comes from `_outbound_loop`. The lock is here
+    # so that a second caller would not interleave these maps, not as a record of one existing —
+    # the one real cross-thread touch (`_reader_unchanged`'s restore) holds no lock at all and is
+    # handled in `_calls` instead.
+    _lock = threading.Lock()
+
+    def __init__(self) -> None:
+        # Tool calls seen in this stream: `_open_calls` = `tool_use` seen, result not yet;
+        # `_closed_calls` = result already seen. Insertion-ordered, so the oldest is the one
+        # dropped over the limit. `_lock` guards both — `continues_turn` and `parse` are called
+        # from the drain, which the bridge runs from more than one thread.
+        self._open_calls: "dict[str, bool]" = {}
+        self._closed_calls: "dict[str, bool]" = {}
+
+    def _trim(self, d: "dict[str, bool]") -> None:
+        while len(d) > self._CALL_LIMIT:
+            del d[next(iter(d))]
+
+    def _calls(self) -> "tuple[dict[str, bool], dict[str, bool]]":
+        """The two call maps, re-created if the instance dictionary was emptied under us.
+
+        `AttachBridge._reader_unchanged` restores reader state with `vars(reader).clear()` +
+        `update(saved)`, and that restore holds no lock. A `parse` that happened to run inside
+        that window would raise `AttributeError`, and the drain has already advanced `_tpos` past
+        the chunk it is reading — so the rest of that chunk, final answer included, would be lost
+        for good. An empty state is harmless here: an unknown id cancels the end-of-turn signal,
+        which is the safe direction.
+        """
+        try:
+            return self._open_calls, self._closed_calls
+        except AttributeError:
+            self._open_calls = {}
+            self._closed_calls = {}
+            return self._open_calls, self._closed_calls
+
+    @staticmethod
+    def _is_tool_result(rec: dict) -> bool:
+        """A ``user`` record that is really a TOOL RESULT, not something the person typed.
+
+        Claude Code files tool results under ``type: "user"``. They are indistinguishable from a
+        real prompt by type alone, and treating one as a prompt is not cosmetic: the bridge
+        decides from the last user text whether the turn came from Telegram, so a tool result
+        silently reclassified a live Telegram turn as terminal-originated and the answer was
+        never forwarded — no error, no backstop, nothing in the log (2026-08-23, an image the
+        agent read mid-turn).
+        """
+        if "toolUseResult" in rec:
+            return True
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, list):
+            return any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+        return False
+
+    def user_text(self, rec: dict) -> str | None:
+        if rec.get("type") != "user" or self._is_tool_result(rec):
+            return None
+        return _text_of(rec.get("message", {}).get("content"))
+
+    @staticmethod
+    def _tool_result_ids(rec: dict) -> "list[str]":
+        """The ids of the calls this tool-result record answers (empty if the file omits them)."""
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            return []
+        return [b["tool_use_id"] for b in content
+                if isinstance(b, dict) and b.get("type") == "tool_result"
+                and isinstance(b.get("tool_use_id"), str) and b.get("tool_use_id")]
+
+    def continues_turn(self, rec: dict) -> bool:
+        """Does this record PROVE the agent is still working? Only a tool RESULT does.
+
+        It exists for the transcript end-of-turn signal (`AttachBridge`): a result means a call
+        was outstanding, so whatever "end_turn" was seen before it did not end the main turn — a
+        sub-agent's (`Task`) answer followed by its result is exactly that shape. The reader
+        yields no event at all for these records (on purpose — a tool result is not a prompt,
+        see `_is_tool_result`), so without this the bridge cannot see them.
+
+        ⛔ It is deliberately NOT "any record the reader ignores". Claude Code writes a
+        housekeeping `attachment` (`total_tokens_reminder`) after nearly every turn, and often a
+        `queue-operation` as well; treating those as "still working" would cancel the signal just
+        after the record that raised it and the whole path would never fire — the failure it was
+        built to fix, through another door.
+
+        A result of a call whose result was ALREADY seen says nothing about now: a duplicate, or
+        an old call's result re-filed late, would otherwise cancel a valid "end_turn" and leave
+        the turn hanging until the idle fallback.
+
+        Three states, not two, because an id this reader never saw called is a different thing
+        from one it saw answered:
+          * some id still OPEN (`tool_use` seen, no result yet) → the agent is working → cancel.
+          * some id UNKNOWN → cannot tell → cancel. The bridge may have attached mid-turn
+            (`_resume_position` starts inside the file), so "no `tool_use` seen" is not "closed".
+          * every id already CLOSED → this result is a repeat → do NOT cancel.
+        ⭐ Open beats closed, which is what makes a REPLAY safe: the bridge rewinds `_tpos` to 0
+        when the transcript is truncated or when it switches files, and reads the whole file
+        again. The `tool_use` records are replayed first and put their ids back among the open
+        ones, so the second pass behaves like the first — no invalidation from the outside needed.
+        That holds only because `parse` registers EVERY call, including the ones that turn into
+        an attachment rather than a tool bubble; a call registered only by its result would be
+        "closed" on the replay and cancel nothing.
+        ⛔ Had this kept "already answered" instead, a replay would see every result as a repeat,
+        cancel nothing and close the turn while the agent worked. The two failures are not
+        symmetrical: cancelling when the agent was in fact done costs a late message, while NOT
+        cancelling mid-work closes the turn mid-flight and the real answer is never forwarded —
+        the incident this whole path was built for.
+        """
+        if rec.get("type") != "user" or not self._is_tool_result(rec):
+            return False
+        ids = self._tool_result_ids(rec)
+        with self._lock:
+            open_calls, closed_calls = self._calls()
+            if ids and all(i in closed_calls and i not in open_calls for i in ids):
+                return False
+            for i in ids:
+                open_calls.pop(i, None)
+                closed_calls[i] = True
+            self._trim(closed_calls)
+        return True
+
     def parse(self, rec: dict):
         typ = rec.get("type")
         if typ == "user":
+            if self._is_tool_result(rec):
+                return                      # a tool result is not something the person typed
             t = _text_of(rec.get("message", {}).get("content"))
             if t.strip():
                 yield Ev("user", text=t)
@@ -126,13 +287,41 @@ class ClaudeCodeReader:
         # the next call re-creates it below (the bridge relies on this order).
         text = "\n".join(b.get("text", "") for b in blocks
                          if isinstance(b, dict) and b.get("type") == "text").strip()
+        stop = (rec.get("message") or {}).get("stop_reason")
         if text:
-            yield Ev("text", text=text, key=rec.get("uuid", "") or _hash(text))
+            yield Ev("text", text=text, key=rec.get("uuid", "") or _hash(text),
+                     final=stop == "end_turn")
         for b in blocks:
             if isinstance(b, dict) and b.get("type") == "tool_use":
                 tid = b.get("id")
-                if tid:
-                    yield Ev("tool", text=_claude_tool_summary(b.get("name", ""), b.get("input")), key=tid)
+                if not tid or not isinstance(tid, str):
+                    continue          # a non-string id would not even be usable as a dict key
+                # BEFORE the file-tool branch below returns: every call this record makes counts,
+                # whatever bubble it turns into. A `SendUserFile` registered only by its RESULT
+                # would behave differently on a replay than on the first pass — the very failure
+                # `continues_turn` was rewritten to remove, through one tool's door.
+                with self._lock:
+                    open_calls, closed_calls = self._calls()
+                    # A replayed `tool_use` moves its id back to open on purpose — see
+                    # `continues_turn`: that is what makes rewinding `_tpos` safe.
+                    closed_calls.pop(tid, None)
+                    open_calls[tid] = True
+                    self._trim(open_calls)
+                paths = _file_tool_paths(b.get("name", ""), b.get("input"))
+                if paths:
+                    yield Ev("files", key=tid, files=paths)
+                    continue                      # not a tool bubble — it is an attachment
+                yield Ev("tool", text=_claude_tool_summary(b.get("name", ""), b.get("input")), key=tid)
+        # LAST, after the tool events of this very record. "end_turn" is the API's own word for
+        # "I stopped, nothing is pending" — a POSITIVE statement about this record, unlike
+        # "the file has been quiet for a while". A record that calls a tool carries stop_reason
+        # "tool_use" and emits no such event at all.
+        # ⛔ Never for a SUB-AGENT record. Claude Code files a Task/sub-agent conversation with
+        # `isSidechain: True`, and its last message ends ITS turn with "end_turn" while the main
+        # agent is still working — taking that for the main turn's end closes the turn before the
+        # real answer is written, and the answer is then never forwarded.
+        if stop == "end_turn" and not rec.get("isSidechain"):
+            yield Ev("assistant_done", key=rec.get("uuid", ""))
 
 
 # --------------------------------------------------------------------------- Codex
@@ -167,6 +356,21 @@ def _codex_tool_summary(payload: dict) -> str:
     return "🛠️ tool"
 
 
+def _codex_message_text(payload: dict, block_type: str) -> str:
+    """Join the ``block_type`` parts of a Codex ``response_item/message`` payload.
+
+    Codex >= 0.149 records user prompts (``input_text``) and assistant replies (``output_text``)
+    only in this form; the legacy ``event_msg`` records are gone.
+    """
+    parts = payload.get("content")
+    if not isinstance(parts, list):
+        return ""
+    return "".join(
+        part.get("text") or "" for part in parts
+        if isinstance(part, dict) and part.get("type") == block_type
+    ).strip()
+
+
 class CodexReader:
     """Codex CLI rollout transcript (``~/.codex/sessions/.../rollout-*.jsonl``). Each line is an
     ``event_msg`` or ``response_item`` with a ``payload.type``. Crucially it records explicit
@@ -175,6 +379,27 @@ class CodexReader:
 
     name = "codex"
     emits_turn_end = True
+
+    def __init__(self) -> None:
+        # Codex <= 0.144 logs an agent reply TWICE: first as ``event_msg/agent_message``, then as
+        # ``response_item/message`` (role=assistant). Newer Codex (>= 0.149) logs ONLY the second
+        # form. We therefore read both and remember what we already emitted, so old versions do not
+        # double-send and new versions do not go silent. Silence is the dangerous failure here: the
+        # bridge keeps showing "typing" while the reply never arrives (reported 2026-08-23).
+        # A bounded window, not a session-wide set: the two records of one reply sit next to each
+        # other in the log, while an agent legitimately repeating the same sentence later in the
+        # session must still be delivered.
+        self._recent_msgs: deque = deque(maxlen=8)
+        self._recent_users: deque = deque(maxlen=8)
+
+    def user_text(self, rec: dict) -> str | None:
+        p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+        if rec.get("type") == "event_msg" and p.get("type") == "user_message":
+            return p.get("message", "")
+        if (rec.get("type") == "response_item" and p.get("type") == "message"
+                and p.get("role") == "user"):
+            return _codex_message_text(p, "input_text") or None
+        return None
 
     def parse(self, rec: dict):
         t = rec.get("type")
@@ -185,13 +410,31 @@ class CodexReader:
         elif t == "event_msg" and pt == "user_message":
             msg = p.get("message", "")
             if msg.strip():
+                h = _hash(msg.strip())
+                if h in self._recent_users:
+                    return
+                self._recent_users.append(h)
+                yield Ev("user", text=msg)
+        elif t == "response_item" and pt == "message" and p.get("role") == "user":
+            msg = _codex_message_text(p, "input_text")
+            if msg and _hash(msg) not in self._recent_users:
+                self._recent_users.append(_hash(msg))
                 yield Ev("user", text=msg)
         elif t == "event_msg" and pt == "agent_message":
             msg = (p.get("message") or "").strip()
             if msg:
                 ts = rec.get("timestamp", "")
+                self._recent_msgs.append(_hash(msg))
                 yield Ev("text", text=msg, key=f"{ts}:{_hash(msg)}",
                          final=(p.get("phase") == "final_answer"))
+        elif t == "response_item" and pt == "message" and p.get("role") == "assistant":
+            # Fallback for Codex >= 0.149, which no longer emits event_msg/agent_message.
+            msg = _codex_message_text(p, "output_text")
+            if msg and _hash(msg) not in self._recent_msgs:
+                ts = rec.get("timestamp", "")
+                self._recent_msgs.append(_hash(msg))
+                yield Ev("text", text=msg, key=f"{ts}:{_hash(msg)}",
+                         final=(p.get("phase") == "final_answer" or p.get("phase") is None))
         elif t == "response_item" and pt in ("function_call", "custom_tool_call", "web_search_call"):
             if pt == "web_search_call":
                 action = p.get("action") if isinstance(p.get("action"), dict) else {}

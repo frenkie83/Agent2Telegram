@@ -29,9 +29,30 @@ pick_bindir() {
   IFS="$oldifs"; printf '%s' "$HOME/.local/bin"
 }
 
-# 1) Python check
-PY="$(command -v python3 || true)"
-[ -n "$PY" ] || err "python3 not found. Install Python ${NEED_PY_MAJOR}.${NEED_PY_MINOR}+ first."
+# 0) Preflight: collect EVERYTHING missing up front and give one install command, instead of
+#    letting the user discover python, then tmux, then git one failed run at a time.
+need=""
+command -v python3 >/dev/null 2>&1 || need="$need python3"
+command -v tmux    >/dev/null 2>&1 || need="$need tmux"      # attach mode drives a tmux session
+# git is only needed if we still have to CLONE (i.e. we're not already inside the project).
+if ! { [ -f pyproject.toml ] && grep -q agent2telegram pyproject.toml 2>/dev/null; }; then
+  command -v git >/dev/null 2>&1 || need="$need git"
+fi
+if [ -n "$need" ]; then
+  need="${need# }"
+  if command -v apt-get >/dev/null 2>&1; then
+    err "Missing: $need — install all at once:  sudo apt-get update && sudo apt-get install -y $need"
+  elif command -v dnf >/dev/null 2>&1; then
+    err "Missing: $need — install all at once:  sudo dnf install -y $need"
+  elif command -v brew >/dev/null 2>&1; then
+    err "Missing: $need — install all at once:  brew install $need"
+  else
+    err "Missing: $need — install these with your package manager, then re-run."
+  fi
+fi
+
+# 1) Python version check (presence is guaranteed by the preflight above)
+PY="$(command -v python3)"
 "$PY" - <<'PYEOF' || err "Python ${NEED_PY_MAJOR}.${NEED_PY_MINOR}+ required."
 import sys
 sys.exit(0 if sys.version_info[:2] >= (3, 10) else 1)
@@ -83,7 +104,7 @@ esac
 # When invoked as `curl … | bash`, this script's stdin is the pipe, not your keyboard,
 # so the interactive wizard must read from the controlling terminal (/dev/tty).
 say "Run it later with:  $HOW run"
-if [ -e /dev/tty ]; then
+if [ -e /dev/tty ] && (: </dev/tty) 2>/dev/null; then
   say "Starting setup…"
   exec "${RUN[@]}" setup </dev/tty
 else

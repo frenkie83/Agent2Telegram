@@ -1,6 +1,8 @@
 """Tests for the Telegram client and message helpers — no network required."""
 import io
 import json
+import os
+import tempfile
 import unittest
 import urllib.error
 
@@ -101,3 +103,62 @@ class TelegramClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SendFileFallbackTests(unittest.TestCase):
+    """A file Telegram refuses to show as a photo/video must still arrive as a document.
+
+    Real case (2026-08-25): a stitched chart 3300x9520 px is a valid PNG, but sendPhoto
+    caps width + height at 10000, so the upload died with HTTP 400 and the file was lost.
+    """
+
+    def _png(self, tmp, name="chart.png"):
+        p = os.path.join(tmp, name)
+        with open(p, "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+        return p
+
+    def test_photo_rejected_falls_back_to_document(self):
+        bad = urllib.error.HTTPError("url", 400, "Bad Request", {}, io.BytesIO(b"{}"))
+        op = _FakeOpener([bad, _ok({"message_id": 7})])
+        client = TelegramClient("123:abc", opener=op)
+        with tempfile.TemporaryDirectory() as tmp:
+            client.send_file(42, self._png(tmp), caption="graf")
+        self.assertEqual(len(op.calls), 2)
+        self.assertTrue(op.calls[0].full_url.endswith("/sendPhoto"))
+        self.assertTrue(op.calls[1].full_url.endswith("/sendDocument"))
+        self.assertIn(b'name="caption"', op.calls[1].data)
+
+    def test_document_failure_is_not_retried_forever(self):
+        bad = urllib.error.HTTPError("url", 400, "Bad Request", {}, io.BytesIO(b"{}"))
+        op = _FakeOpener([bad])
+        client = TelegramClient("123:abc", opener=op)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "notes.xyz")      # unknown type -> sendDocument
+            with open(p, "wb") as fh:
+                fh.write(b"x")
+            with self.assertRaises(Exception):
+                client.send_file(42, p)
+        self.assertEqual(len(op.calls), 1)
+
+    def test_successful_photo_sends_once(self):
+        op = _FakeOpener([_ok({"message_id": 3})])
+        client = TelegramClient("123:abc", opener=op)
+        with tempfile.TemporaryDirectory() as tmp:
+            client.send_file(42, self._png(tmp))
+        self.assertEqual(len(op.calls), 1)
+        self.assertTrue(op.calls[0].full_url.endswith("/sendPhoto"))
+
+    def test_video_meta_dropped_on_document_fallback(self):
+        bad = urllib.error.HTTPError("url", 400, "Bad Request", {}, io.BytesIO(b"{}"))
+        op = _FakeOpener([bad, _ok({"message_id": 9})])
+        client = TelegramClient("123:abc", opener=op)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "reel.mp4")
+            with open(p, "wb") as fh:
+                fh.write(b"\x00" * 32)
+            client.send_file(42, p, meta={"width": 1080, "height": 1920, "duration": 30})
+        body = op.calls[1].data
+        for gone in (b'name="width"', b'name="height"', b'name="duration"',
+                     b'name="supports_streaming"'):
+            self.assertNotIn(gone, body)
