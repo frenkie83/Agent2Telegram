@@ -369,6 +369,22 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
                 os.chmod(outbox.pending_directory, 0o755)
             self.assertEqual(sent, ["R1", "R2", "NEW"])
 
+    def test_a_record_conflict_is_not_taken_for_a_refusing_disk(self):
+        """Codex (PR #9): only write errors fall back to the in-memory path; an id that already
+        holds different content must surface, not end up in `_pending_send`."""
+        from agent2telegram.durable import RecordConflictError
+        with tempfile.TemporaryDirectory() as td:
+            b = _loop_bridge(td)
+            outbox = b._ensure_outbox()
+
+            def _conflict(*a, **kw):
+                raise RecordConflictError("id exists with different content")
+            outbox.enqueue = _conflict
+            with self.assertRaises(RecordConflictError):
+                b._send_final("reply", "k1")
+            self.assertEqual(b._pending_send, [])
+            self.assertEqual(b.tg.sent, [])
+
 
 if __name__ == "__main__":
     unittest.main()

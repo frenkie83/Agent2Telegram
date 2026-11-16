@@ -38,7 +38,7 @@ from . import readers
 from . import tts
 from .compat import AlreadyRunning, single_instance_lock
 from .config import Config, _state_dir
-from .durable import DurableError, DurableInbox, DurableOutbox
+from .durable import DurableError, DurableInbox, DurableOutbox, RecordConflictError
 from .session import SessionError, TmuxSession
 from .telegram import TelegramClient, TelegramError, is_network_error, split_message
 
@@ -1235,7 +1235,12 @@ class AttachBridge:
             files = list(getattr(self, "_pending_files", []) or [])
             try:
                 outbox.enqueue(chunks, files, key)
-            except Exception as e:
+            except RecordConflictError:
+                # Not a refusing disk: the same id already holds DIFFERENT content. Falling back to
+                # the in-memory path would hide that (and could send a second, different reply
+                # under the id) — it surfaces exactly as it did before T-1060.
+                raise
+            except (OSError, DurableError) as e:      # only what a refusing disk raises
                 # Throttled: a reply per tick while the disk is bad would flood that disk's log.
                 self._ledger_warn("queue-enqueue", "could not persist the outgoing reply, falling "
                                   "back to the old path (in memory, retried every tick): %s", e)
