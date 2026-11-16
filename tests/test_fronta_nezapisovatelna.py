@@ -304,6 +304,28 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
             self.assertEqual(uploads[0], OUTBOX_MAX_ATTEMPTS)
             self.assertEqual(b._unsent_files(), [])
 
+    def test_held_attachment_is_not_stuck_behind_a_head_that_only_waits_for_its_confirmation(self):
+        """Review: with the disk STILL read-only, the older record's text goes out but its
+        confirmation cannot be written — it must not hold the attachment (memory-only) forever."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _loop_bridge(td)
+            outbox = b._ensure_outbox()
+            events = []
+            b.tg.send_message = lambda chat, text, parse_mode=None: events.append(("text", text))
+            b._send_one_file = lambda p: events.append(("file", p))
+            outbox.enqueue(["old"], [], "k-old")
+            b._pending_files = ["/outbox/a.pdf"]
+            os.chmod(outbox.pending_directory, 0o555)
+            try:
+                b._send_final("new", "k-new")
+                for _ in range(5):
+                    b._flush_pending()                    # the disk never heals here
+            finally:
+                os.chmod(outbox.pending_directory, 0o755)
+            self.assertEqual(events.count(("file", "/outbox/a.pdf")), 1)
+            self.assertLess(events.index(("text", "old")), events.index(("file", "/outbox/a.pdf")))
+            self.assertEqual(events.count(("text", "old")), 1, "and the old text is not re-sent")
+
 
 if __name__ == "__main__":
     unittest.main()

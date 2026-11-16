@@ -3077,7 +3077,19 @@ class AttachBridge:
         if outbox is None:
             return False
         ok, rec = self._queue_write("read", outbox.head)
-        return (not ok) or rec is not None
+        if not ok:
+            return True
+        if rec is None:
+            return False
+        # ⛔ A head that has NOTHING LEFT TO SEND is not "an older reply waiting": its parts went out
+        # and only the confirmation is unrecorded (disk refusing writes, `_queue_memory`). Waiting
+        # for it to leave the queue would hold the attachment, in memory only, for the whole
+        # outage — and a restart would lose it silently.
+        held = self._queue_memory().get(rec.record_id, [])
+        held_c = {w for k, w in held if k == "c"}
+        held_f = {w for k, w in held if k == "f"}
+        return (any(i not in held_c for i, _ in rec.pending_chunks)
+                or any(f not in held_f for f in rec.pending_files))
 
     def _flush_unsent_files(self) -> None:
         """Upload the held attachments in order; a path leaves the list only after a confirmed
