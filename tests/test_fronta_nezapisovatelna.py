@@ -228,6 +228,34 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
             self.assertIn("kg", b._sent_keys,
                           "the text was delivered; without the key a restart sends it again")
 
+    def test_attachment_only_reply_survives_a_failed_enqueue_and_a_failed_upload(self):
+        """T-1096: `enqueue` refused → the old path used to clear `_pending_files` BEFORE the
+        upload, so one failed upload lost the attachment; and an empty text was sent/queued."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _loop_bridge(td)
+            outbox = b._ensure_outbox()
+            outcomes = [RuntimeError("timeout"), None]
+            uploaded = []
+
+            def _upload(path):
+                err = outcomes.pop(0) if outcomes else None
+                if err:
+                    raise err
+                uploaded.append(path)
+            b._send_one_file = _upload
+            b._pending_files = ["/outbox/report.pdf"]
+            os.chmod(outbox.pending_directory, 0o555)
+            try:
+                b._send_final("", None)               # enqueue refused, 1st upload fails
+                self.assertEqual(b.tg.sent, [], "no empty text may be sent")
+                self.assertEqual(b._pending_send, [], "no empty text may be queued")
+                b._flush_pending()                    # next tick: upload succeeds
+            finally:
+                os.chmod(outbox.pending_directory, 0o755)
+            self.assertEqual(uploaded, ["/outbox/report.pdf"])
+            b._flush_pending()
+            self.assertEqual(uploaded, ["/outbox/report.pdf"], "uploaded once, not again")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1200,6 +1200,18 @@ class AttachBridge:
                 # Throttled: a reply per tick while the disk is bad would flood that disk's log.
                 self._ledger_warn("queue-enqueue", "could not persist the outgoing reply, falling "
                                   "back to the old path (in memory, retried every tick): %s", e)
+                # ⛔ T-1096: the old path's `_flush_files` clears the paths BEFORE the upload, so a
+                # failed upload lost the attachment for good. Attachments move to a memory list
+                # that only forgets a path after a confirmed upload (bounded retries, every tick).
+                held = list(getattr(self, "_pending_files", []) or [])
+                if held:
+                    self._pending_files = []
+                    self._unsent_files().extend([p, 0] for p in held)
+                    if turn_text:
+                        self._turn_text_sent = True      # handled, like a durably stored reply
+                    self._flush_unsent_files()
+                if not text:
+                    return          # attachment-only reply: no empty text to send or to queue
             else:
                 self._pending_files = []
                 if turn_text:
@@ -1317,6 +1329,10 @@ class AttachBridge:
         """Deliver the queue FIFO, stopping at the first failure to preserve order. Called every
         outbound cycle, so a network hiccup self-heals within one tick."""
         self._retry_unconfirmed_ledger()
+        try:
+            self._flush_unsent_files()     # attachments the queue refused (T-1096)
+        except Exception as e:             # must not end the tick
+            self._ledger_warn("unsent-file", "could not retry held attachments: %s", e)
         outbox = self._ensure_outbox()
         # ⛔ T-1060: EVERY write below goes through `_queue_write` and the loop never raises for a
         # disk that refuses it. When the queue cannot record a confirmation, Telegram HAS already
@@ -3034,6 +3050,34 @@ class AttachBridge:
                 "~/.config/agent2telegram/attach_sent.txt.")
         except Exception as e:
             log.warning("could not report the unwritable ledger: %s", e)
+
+    def _unsent_files(self) -> list:
+        """Attachments the durable queue refused and the old path must still deliver: `[path,
+        failed_attempts]` pairs, in memory only (a restart loses them — the queue was the only
+        durable place and it is the thing that is broken)."""
+        with _LEDGER_INIT_LOCK:
+            held = getattr(self, "_unsent_file_list", None)
+            if held is None:
+                held = []
+                self._unsent_file_list = held
+            return held
+
+    def _flush_unsent_files(self) -> None:
+        """Upload the held attachments in order; a path leaves the list only after a confirmed
+        upload or, once `OUTBOX_MAX_ATTEMPTS` uploads failed, after the owner was told."""
+        held = self._unsent_files()
+        while held and self._owner_chat is not None:
+            entry = held[0]
+            try:
+                self._send_one_file(entry[0])
+            except Exception as e:
+                entry[1] += 1
+                if entry[1] < OUTBOX_MAX_ATTEMPTS:
+                    self._ledger_warn("unsent-file", "held attachment %s not uploaded (%d/%d): %s",
+                                      entry[0], entry[1], OUTBOX_MAX_ATTEMPTS, e)
+                    return
+                self._report_permanent_refusal(Path(entry[0]).name, str(e))
+            held.pop(0)
 
     def _flush_files(self) -> None:
         """Upload whatever the last reply asked for. Kept separate from the text path so a
