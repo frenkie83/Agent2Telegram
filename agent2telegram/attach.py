@@ -1197,7 +1197,9 @@ class AttachBridge:
             try:
                 outbox.enqueue(chunks, files, key)
             except Exception as e:
-                log.error("could not persist the outgoing reply, falling back to the old path: %s", e)
+                # Throttled: a reply per tick while the disk is bad would flood that disk's log.
+                self._ledger_warn("queue-enqueue", "could not persist the outgoing reply, falling "
+                                  "back to the old path (in memory, retried every tick): %s", e)
             else:
                 self._pending_files = []
                 if turn_text:
@@ -1256,32 +1258,111 @@ class AttachBridge:
             self._outbox = outbox
         return outbox
 
+    def _queue_write(self, what: str, fn, *args):
+        """THE door for every write the outbound cycle makes into the durable queue (T-1060).
+
+        Returns `(True, result)`, or `(False, None)` when the disk refused (`OSError`, which also
+        covers `PermissionError`/ENOSPC/EROFS, or `DurableError`). The failure is logged
+        THROTTLED per `what` — one line per `LEDGER_WARN_EVERY`, never per tick: the usual cause is
+        a full disk, and a line per tick floods that very disk.
+
+        ⛔ Why a door and not a `try` per call: the refusal is the same stuff (full disk, read-only
+        remount, quota) for every one of them, and an `OSError` escaping `_flush_pending` ends the
+        WHOLE tick — no transcript drain, no turn end, no `_beat()` — until the disk heals, and the
+        watchdog then restarts the bridge in a loop.
+
+        "Could not write" ⛔ never means "sent": a caller that gets False leaves the record queued
+        and the ledger unmarked."""
+        try:
+            return True, fn(*args)
+        except (OSError, DurableError) as e:
+            self._ledger_warn("queue-" + what, "the outbound queue refused a write (%s): %s — the "
+                              "outbound cycle continues and the next tick retries", what, e)
+            return False, None
+
+    def _queue_memory(self) -> dict:
+        """Per record: what Telegram confirmed but the queue could not record yet, as an ordered
+        list of `("c", index)` / `("f", path)`. In memory ONLY, on purpose — see `_flush_pending`."""
+        with _LEDGER_INIT_LOCK:
+            mem = getattr(self, "_queue_unrecorded", None)
+            if mem is None:
+                mem = {}
+                self._queue_unrecorded = mem
+            return mem
+
+    def _record_confirmed(self, outbox, rec_id: str) -> bool:
+        """Write the confirmations held in memory into the record, in the order they happened.
+        True when nothing is left unrecorded. Stops at the first refusal (the queue enforces order)."""
+        waiting = self._queue_memory().get(rec_id)
+        while waiting:
+            kind, what = waiting[0]
+            fn = outbox.mark_chunk_sent if kind == "c" else outbox.mark_file_sent
+            ok, _ = self._queue_write("confirm", fn, rec_id, what)
+            if not ok:
+                return False
+            waiting.pop(0)
+        self._queue_memory().pop(rec_id, None)
+        return True
+
     def _flush_pending(self) -> None:
         """Deliver the queue FIFO, stopping at the first failure to preserve order. Called every
         outbound cycle, so a network hiccup self-heals within one tick."""
         self._retry_unconfirmed_ledger()
         outbox = self._ensure_outbox()
+        # ⛔ T-1060: EVERY write below goes through `_queue_write` and the loop never raises for a
+        # disk that refuses it. When the queue cannot record a confirmation, Telegram HAS already
+        # delivered the part — so it is held in MEMORY (`_queue_memory`) and skipped, and written
+        # for real once the disk takes it. DECISION (the PR names it): text whose confirmation
+        # cannot be written stays in memory and is NOT re-sent every tick, ⛔ not "re-send until it
+        # sticks" (a flood while the disk is bad); the price is paid only on a crash/restart in
+        # that window — the part is then re-sent once (a duplicate, never a loss).
         while outbox is not None and self._owner_chat is not None:
-            rec = outbox.head()
+            ok, rec = self._queue_write("read", outbox.head)
+            if not ok:
+                return        # the queue cannot even be read (its maintenance writes) — next tick
             if rec is None:
                 break
+            if rec.record_id in self._queue_memory():
+                # An earlier tick delivered something the queue could not record. Settle it first,
+                # then read the record again — the stale copy still lists those parts as pending.
+                self._record_confirmed(outbox, rec.record_id)
+                ok, rec = self._queue_write("read", outbox.head)
+                if not ok:
+                    return
+                if rec is None:
+                    break
+            held = self._queue_memory().get(rec.record_id, [])
+            held_chunks = {w for k, w in held if k == "c"}
+            held_files = {w for k, w in held if k == "f"}
             # Parts already confirmed by Telegram are NOT resent — only the remaining ones.
             for index, chunk in rec.pending_chunks:
+                if index in held_chunks:
+                    continue
                 try:
                     self.tg.send_message(self._owner_chat, chunk)
                 except Exception as e:
                     log.warning("delivery of part %d still failing: %s", index, e)
                     return
-                outbox.mark_chunk_sent(rec.record_id, index)
+                ok, _ = self._queue_write("confirm", outbox.mark_chunk_sent, rec.record_id, index)
+                if not ok:
+                    self._queue_memory().setdefault(rec.record_id, []).append(("c", index))
             vzdano = False
             for file_path in rec.pending_files:
+                if file_path in held_files:
+                    continue
                 try:
                     self._send_one_file(file_path)
                 except Exception as e:
                     # Bounded retries: without them one bad attachment (over the size limit,
                     # a deleted file, HTTP 400) would hold the head of the FIFO queue forever
                     # and NO further reply would reach the user (finding F2).
-                    attempts = outbox.fail(rec.record_id, f"{file_path}: {e}")
+                    ok, attempts = self._queue_write("fail", outbox.fail, rec.record_id,
+                                                     f"{file_path}: {e}")
+                    if not ok:
+                        # `fail` is a disk write too; count in memory, same as the ledger below.
+                        tries = self._ledger_attempt_counts()
+                        attempts = tries.get(("file", rec.record_id), 0) + 1
+                        tries[("file", rec.record_id)] = attempts
                     log.warning("delivery of attachment %s failed (%d/%d): %s",
                                 file_path, attempts, OUTBOX_MAX_ATTEMPTS, e)
                     if attempts >= OUTBOX_MAX_ATTEMPTS:
@@ -1291,14 +1372,24 @@ class AttachBridge:
                         # review round. The whole record goes to dead-letter: it leaves the queue
                         # (so it does not clog it) but stays traceable, including which parts
                         # did get delivered.
+                        # ⛔ Moving it to dead-letter FIRST, the notice only after it worked: when
+                        # the disk refuses `give_up`, the next tick lands here again, and a notice
+                        # sent before it would go out once per tick.
+                        ok, _ = self._queue_write("give-up", outbox.give_up, rec.record_id,
+                                                  f"attachment {file_path}: {e}")
+                        if not ok:
+                            return
+                        self._ledger_attempt_counts().pop(("file", rec.record_id), None)
+                        self._queue_memory().pop(rec.record_id, None)
                         self._report_permanent_refusal(Path(file_path).name, str(e))
-                        outbox.give_up(rec.record_id, f"attachment {file_path}: {e}")
                         log.error("attachment %s gave up after %d attempts → dead-letter",
                                   file_path, attempts)
                         vzdano = True
                         break
                     return
-                outbox.mark_file_sent(rec.record_id, file_path)
+                ok, _ = self._queue_write("confirm", outbox.mark_file_sent, rec.record_id, file_path)
+                if not ok:
+                    self._queue_memory().setdefault(rec.record_id, []).append(("f", file_path))
             if vzdano:
                 # The TEXT of this record may well have been delivered in full (chunks are
                 # confirmed one by one, the attachment is what gave up) — then its ids belong in
@@ -1351,17 +1442,17 @@ class AttachBridge:
             # and a restart with an unwritten key is the duplicate this ledger exists to prevent.
             # Guarded on the ONE line both paths go through, not per branch (rule 8b). The record
             # stays queued and the next tick tries again; its chunks are already confirmed, so
-            # nothing is re-sent. ⚠️ The queue's OTHER writes (`enqueue`, `mark_chunk_sent`,
-            # `mark_file_sent`, `give_up`, `_persist_queue`) are still unguarded — a pre-existing
-            # hole, measured on the base branch too, filed as T-1060.
-            try:
-                outbox.done(rec.record_id)
-            except (OSError, DurableError) as e:
-                self._ledger_warn("release", "could not release the delivered record %s from the "
-                                  "queue (%s) — the outbound cycle continues and the next tick "
-                                  "retries; nothing is re-sent", rec.record_id, e)
+            # nothing is re-sent. Since T-1060 the queue's other writes go through the same door
+            # (`_queue_write`); `done` stays on its own line only because its failure ends THIS
+            # record's pass, and it forgets the in-memory bookkeeping when it finally works.
+            if not self._record_confirmed(outbox, rec.record_id):
+                return        # `done` would refuse a record whose confirmations are not on disk
+            ok, _ = self._queue_write("release", outbox.done, rec.record_id)
+            if not ok:
                 return
             self._ledger_attempt_counts().pop(rec.record_id, None)
+            self._ledger_attempt_counts().pop(("file", rec.record_id), None)
+            self._queue_memory().pop(rec.record_id, None)
             # The record id and a text preview are logged ON PURPOSE: on 2026-08-01 the user
             # received one reply twice and the log could not tell whether it was the same
             # message delivered twice or two different ones. Without that, any fix is a guess.
