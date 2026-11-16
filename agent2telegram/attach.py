@@ -1353,20 +1353,22 @@ class AttachBridge:
         # cannot be written stays in memory and is NOT re-sent every tick, ⛔ not "re-send until it
         # sticks" (a flood while the disk is bad); the price is paid only on a crash/restart in
         # that window — the part is then re-sent once (a duplicate, never a loss).
+        stalled: set = set()     # records fully delivered whose release the disk refuses this tick
         while outbox is not None and self._owner_chat is not None:
-            ok, rec = self._queue_write("read", outbox.head)
+            ok, rec = self._next_record(outbox, stalled)
             if not ok:
-                return        # the queue cannot even be read (its maintenance writes) — next tick
+                # The queue cannot be read (its maintenance WRITES — it reads nothing on a disk
+                # that refuses them). ⛔ `break`, not `return`: the legacy list behind it must
+                # still go out, or the bridge delivers nothing for the whole outage.
+                break
             if rec is None:
                 break
             if rec.record_id in self._queue_memory():
                 # An earlier tick delivered something the queue could not record. Settle it first,
                 # then read the record again — the stale copy still lists those parts as pending.
                 self._record_confirmed(outbox, rec.record_id)
-                ok, rec = self._queue_write("read", outbox.head)
-                if not ok:
-                    return
-                if rec is None:
+                ok, rec = self._next_record(outbox, stalled)
+                if not ok or rec is None:
                     break
             held = self._queue_memory().get(rec.record_id, [])
             held_chunks = {w for k, w in held if k == "c"}
@@ -1499,12 +1501,14 @@ class AttachBridge:
             # throttled log) and `_persist_queue` (swallows `OSError` silently, legacy list only).
             if not self._record_confirmed(outbox, rec.record_id):
                 # `done` would refuse a record whose confirmations are not on disk. Everything of
-                # this record HAS been delivered, so what is behind it may go out (`break`, not
-                # `return`: FIFO is kept, and the legacy list must not wait out the whole outage).
-                break
+                # this record HAS been delivered, so what is behind it may go out — the NEXT
+                # record, then the legacy list (FIFO is kept; nothing waits out the whole outage).
+                stalled.add(rec.record_id)
+                continue
             ok, _ = self._queue_write("release", outbox.done, rec.record_id)
             if not ok:
-                break
+                stalled.add(rec.record_id)
+                continue
             self._ledger_attempt_counts().pop(rec.record_id, None)
             self._ledger_attempt_counts().pop(("file", rec.record_id), None)
             self._queue_memory().pop(rec.record_id, None)
@@ -3077,6 +3081,24 @@ class AttachBridge:
                 self._unsent_file_list = held
             return held
 
+    def _next_record(self, outbox, skip: set):
+        """`(ok, first pending record not in skip)`. Reads the whole queue: `head()` would keep
+        returning a delivered record whose release the disk refuses, hiding the ones behind it."""
+        ok, recs = self._queue_write("read", outbox.pending)
+        if not ok:
+            return False, None
+        for r in recs:
+            if r.record_id not in skip:
+                return True, r
+        return True, None
+
+    def _record_has_work(self, rec) -> bool:
+        held = self._queue_memory().get(rec.record_id, [])
+        held_c = {w for k, w in held if k == "c"}
+        held_f = {w for k, w in held if k == "f"}
+        return (any(i not in held_c for i, _ in rec.pending_chunks)
+                or any(f not in held_f for f in rec.pending_files))
+
     def _queues_busy(self) -> bool:
         """Is anything older still waiting — the legacy list or a durable record (or unreadable)?"""
         if self._pending_send:
@@ -3084,20 +3106,13 @@ class AttachBridge:
         outbox = getattr(self, "_outbox", None)
         if outbox is None:
             return False
-        ok, rec = self._queue_write("read", outbox.head)
-        if not ok:
-            return True
-        if rec is None:
-            return False
-        # ⛔ A head that has NOTHING LEFT TO SEND is not "an older reply waiting": its parts went out
-        # and only the confirmation is unrecorded (disk refusing writes, `_queue_memory`). Waiting
-        # for it to leave the queue would hold the attachment, in memory only, for the whole
-        # outage — and a restart would lose it silently.
-        held = self._queue_memory().get(rec.record_id, [])
-        held_c = {w for k, w in held if k == "c"}
-        held_f = {w for k, w in held if k == "f"}
-        return (any(i not in held_c for i, _ in rec.pending_chunks)
-                or any(f not in held_f for f in rec.pending_files))
+        # ⛔ A record that has NOTHING LEFT TO SEND is not "an older reply waiting": its parts went
+        # out and only the confirmation is unrecorded (disk refusing writes, `_queue_memory`).
+        # Waiting for it to leave the queue would hold what follows, in memory only, for the whole
+        # outage — and a restart would lose it silently. ⛔ And a queue that cannot be READ counts
+        # as not busy: delivering (possibly out of order) beats delivering nothing.
+        ok, recs = self._queue_write("read", outbox.pending)
+        return ok and any(self._record_has_work(r) for r in recs)
 
     def _flush_unsent_files(self) -> None:
         """Upload the held attachments in order; a path leaves the list only after a confirmed

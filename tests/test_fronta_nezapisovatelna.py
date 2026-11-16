@@ -168,7 +168,7 @@ class UnwritableQueueEdgeTests(unittest.TestCase):
             self.assertEqual([t for _, t in b.tg.sent], ["one", "two", "three"])
             self.assertIsNone(outbox.head())
 
-    def test_second_record_waits_behind_a_stuck_first_and_follows_it_after_healing(self):
+    def test_second_record_follows_a_delivered_first_whose_release_the_disk_refuses(self):
         with tempfile.TemporaryDirectory() as td:
             b = _loop_bridge(td)
             outbox = b._ensure_outbox()
@@ -182,8 +182,9 @@ class UnwritableQueueEdgeTests(unittest.TestCase):
             finally:
                 os.chmod(outbox.pending_directory, 0o755)
             b._flush_pending()
+            # first is fully delivered (only its release is refused) — second must not wait for it
             self.assertEqual((stuck, [t for _, t in b.tg.sent]),
-                             (["first"], ["first", "second"]))
+                             (["first", "second"], ["first", "second"]))
 
     def test_a_queue_whose_maintenance_cannot_write_still_lets_the_tick_reach_the_heartbeat(self):
         # Real refusal inside `head()`: an expired record must move to dead-letter during
@@ -320,6 +321,53 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
             finally:
                 os.chmod(outbox.pending_directory, 0o755)
             self.assertEqual(events, [("text", "old"), ("text", "new"), ("file", "/outbox/a.pdf")])
+
+    def test_a_head_that_cannot_be_read_does_not_stop_deliveries(self):
+        """Review 1: `head()`/`pending()` run maintenance WRITES; a stale temp file + read-only
+        directory makes them raise on every tick. New replies must still arrive."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _loop_bridge(td)
+            outbox = b._ensure_outbox()
+            stale = outbox.pending_directory / ".out-stale.tmp"
+            stale.write_text("x")
+            os.utime(stale, (1, 1))                      # ancient → maintenance wants to delete it
+            os.chmod(outbox.pending_directory, 0o555)
+            try:
+                with self.assertRaises(OSError):
+                    outbox.pending()                     # premise: the read really fails
+                b._send_final("reply", "kr")
+                for _ in range(3):
+                    b._flush_pending()
+            finally:
+                os.chmod(outbox.pending_directory, 0o755)
+            self.assertEqual([t for _, t in b.tg.sent], ["reply"])
+
+    def test_a_new_reply_does_not_overtake_a_record_behind_a_stalled_head(self):
+        """Review 2: R1 delivered (release refused), R2 still waiting — NEW goes behind R2."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _loop_bridge(td)
+            outbox = b._ensure_outbox()
+            sent = []
+            gate = {"open": False}
+
+            def _send(chat, text, parse_mode=None):
+                if text == "R2" and not gate["open"]:
+                    raise RuntimeError("network")
+                sent.append(text)
+            b.tg.send_message = _send
+            outbox.enqueue(["R1"], [], "k1")
+            outbox.enqueue(["R2"], [], "k2")
+            os.chmod(outbox.pending_directory, 0o555)
+            try:
+                b._flush_pending()                        # R1 out, R2 fails on the network
+                b._send_final("NEW", "kn")
+                self.assertEqual(sent, ["R1"], "NEW must not overtake the waiting R2")
+                gate["open"] = True
+                for _ in range(3):
+                    b._flush_pending()
+            finally:
+                os.chmod(outbox.pending_directory, 0o755)
+            self.assertEqual(sent, ["R1", "R2", "NEW"])
 
 
 if __name__ == "__main__":
