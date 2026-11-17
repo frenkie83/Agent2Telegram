@@ -48,7 +48,7 @@ def _running_bridges() -> list[tuple[str, str | None]]:
 def _proc_env(pid: str) -> dict:
     """Best-effort read of a process's own environment (Linux ``/proc/<pid>/environ``). Lets us
     relaunch a bridge with the SAME ``AGENT2TELEGRAM_CONFIG`` / ``PYTHONPATH`` / ``PATH`` it was
-    started with — e.g. a supervisor (agentsmon, bridge_boot) starts attach-mode bridges via an
+    started with — a supervisor may start attach-mode bridges through an
     env var rather than a ``--config`` flag, so without this the relaunch would silently fall back
     to the DEFAULT config and the bridge would come back wrong (or without the new key). Empty on
     platforms without ``/proc`` (e.g. macOS), where the ``--config`` from the command line is used."""

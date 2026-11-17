@@ -49,6 +49,12 @@ token and their Telegram user id, then write `~/.config/agent2telegram/config.js
 …and `chmod 600` it. To get the user's id: have them message the bot, then read it from
 `getUpdates`, or ask them to send `/id` to the bot once it's running.
 
+**Sending a file TO the user:** if your agent has its own file-sending tool (Claude Code's
+`SendUserFile`), use it — the bridge picks it up from the transcript automatically. Otherwise put
+`[tg-file] /path/to/file` on its own line in the reply. Either way the path must be inside the
+allowed outbox (`~/.local/state/agent2telegram/outbox` by default); anything else is refused with
+a visible message, never dropped silently.
+
 **Attachments & voice:** images and files work out of the box (they're downloaded and handed
 to the agent). Voice transcription is optional — ask the user if they want it; if yes, add
 their **own** ElevenLabs key as `elevenlabs_api_key` (or `ELEVENLABS_API_KEY`). Never use a
@@ -86,4 +92,5 @@ Install it per the printed hints so the bridge starts on boot and restarts on cr
 ## When done, tell the user
 - which agent is connected, the bot's @username,
 - that **only their** Telegram account can use it,
-- how to start a fresh conversation (`/reset`) and check status (`/status`).
+- how to check status (`/status`) and toggle spoken replies (`/voice`),
+- that `/help` in the chat lists everything the bridge itself handles.

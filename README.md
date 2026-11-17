@@ -137,6 +137,8 @@ from Telegram.
 | `/start`, `/help` | short intro + what you can send |
 | `/status` | which agent + tmux session you're connected to (and whether voice is on) |
 | `/setkey <key>` | enable voice transcription with your ElevenLabs key — your message is deleted right after so the key isn't left in the chat |
+| `/voice` | toggle spoken replies — the agent's answer comes back as a voice note (needs an ElevenLabs key) |
+| `zapni hlas` / `vypni hlas` | the same switch, hands‑free: a dictated `/voice` comes out of speech‑to‑text as "slash voice", so these two phrases are recognised as well. Matched as the **whole** message, so "zapni hlas až dojedu" goes to the agent like any other sentence. |
 | `/id` | show your user / chat id (handy for the allow‑list) |
 
 Anything that isn't one of these (including other `/commands`) is passed through to the agent.
@@ -295,3 +297,45 @@ python3 -m unittest discover -s tests -v   # zero-dependency test suite
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Sending files from the agent
+
+**If your agent has its own file-sending tool, just use it.** Claude Code's `SendUserFile` is
+recognised automatically: the bridge sees the call in the transcript and delivers the files. No
+marker, no configuration, nothing to remember — it works on the first try.
+
+The harness runs that tool itself, so the bridge never sees a call, only its record in the
+transcript. Before this was recognised the file silently vanished: the reply arrived, the
+attachment did not, and nothing in the log said so.
+
+There is also an explicit marker, which works with any agent — put a line like this in the reply:
+
+```
+[tg-file] /Users/me/.local/state/agent2telegram/outbox/clip.mp4
+```
+
+The bridge removes that line from the message, sends the text, then uploads the file.
+The API method follows the extension, so video arrives playable, audio as a track and
+images as photos; anything else goes as a document. Bots can upload at most 50 MB —
+larger files fail immediately with a clear message instead of a long doomed upload.
+
+**The path is checked against an allowlist, and that is a security boundary.** The path
+comes from the agent's own reply text, so a wide allowlist would turn a prompt injection
+into file exfiltration. By default only `~/.local/state/agent2telegram/outbox` is allowed;
+symlinks are resolved *before* the check, so a link inside the outbox pointing at
+`~/.ssh/id_rsa` is refused. Add more folders explicitly if you need them:
+
+```json
+{ "outbox_dirs": ["/Users/me/renders"] }
+```
+
+A refused attachment is always reported back into the chat — silently dropping a file
+would be worse than a visible error.
+
+From cron or a background job (where there is no Telegram turn to reply in) use
+`notify`, which enforces the same allowlist:
+
+```
+python -m agent2telegram notify --file ~/.local/state/agent2telegram/outbox/clip.mp4 \
+    "render finished"
+```

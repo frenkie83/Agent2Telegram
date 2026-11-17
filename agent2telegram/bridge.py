@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import __version__, adapters
 from .config import Config, _state_dir
-from .telegram import TelegramClient
+from .telegram import TelegramClient, TelegramError, is_network_error
 
 log = logging.getLogger("agent2telegram.bridge")
 
@@ -70,15 +70,39 @@ class Bridge:
                         "Message the bot and check /id, then add your id to the config.")
         self._install_signal_handlers()
         offset = self._load_offset()
+        transient_fails = 0
+        outage_alerted = False
         while not self._stop.is_set():
             try:
                 updates = self.tg.get_updates(offset, timeout=self.cfg.poll_timeout)
-            except Exception as e:                       # never let the loop die
-                log.error("getUpdates failed: %s", e)
+            except (TelegramError, OSError) as e:
+                if is_network_error(e):
+                    # Transient network/DNS problem (Errno 8, connection reset, timeout) — the
+                    # bridge recovers on its own. WARNING + backoff; ERROR only ONCE during a
+                    # longer outage, so monitoring doesn't alert on a self-healing blip.
+                    transient_fails += 1
+                    if transient_fails >= 10 and not outage_alerted:
+                        log.error("getUpdates network outage (%d in a row) is lasting: %s",
+                                  transient_fails, e)
+                        outage_alerted = True
+                    else:
+                        log.warning("getUpdates transient network error (%d): %s", transient_fails, e)
+                    self._stop.wait(min(3 * transient_fails, 30))
+                    continue
+                log.error("getUpdates failed: %s", e)     # a real (non-network) error
                 self._stop.wait(3)
                 continue
+            if outage_alerted:
+                log.info("getUpdates network recovered after %d errors", transient_fails)
+            transient_fails = 0
+            outage_alerted = False
             for upd in updates:
-                offset = max(offset, upd["update_id"] + 1)
+                try:
+                    update_id = int(upd["update_id"])
+                except (KeyError, TypeError, ValueError):
+                    log.warning("skipping malformed Telegram update without a valid update_id: %r", upd)
+                    continue
+                offset = max(offset, update_id + 1)
                 try:
                     self._dispatch(upd)
                 except Exception as e:
@@ -232,6 +256,8 @@ class Bridge:
             if user_id in self._allowed:
                 self._reset_chat(chat_id)
                 self.tg.send_message(chat_id, "🔄 Fresh conversation started.")
+            else:
+                self.tg.send_message(chat_id, "⛔ You're not authorized to use this bot.")
             return True
         return False  # not a known command → treat as a normal prompt
 

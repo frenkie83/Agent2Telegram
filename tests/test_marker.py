@@ -17,14 +17,14 @@ class StripMarkerTests(unittest.TestCase):
 
     def test_marker_on_a_later_line_removed(self):
         """Narration first, then a [TG] reply line — the stray marker must not survive (the
-        2026-06-20 'zatoulané [tg]' bug)."""
-        out = _strip("Hotovo. Teď odpovím:\n\n[TG] 🐱 Super, šlape to.")
+        2026-06-20 'orphaned [tg]' bug)."""
+        out = _strip("Done. Here is the answer:\n\n[TG] 🐱 All good, it works.")
         self.assertNotIn("[TG]", out)
-        self.assertIn("🐱 Super, šlape to.", out)
+        self.assertIn("🐱 All good, it works.", out)
 
     def test_case_insensitive(self):
-        self.assertEqual(_strip("[tg] ahoj"), "ahoj")
-        self.assertEqual(_strip("[Tg] ahoj"), "ahoj")
+        self.assertEqual(_strip("[tg] hi"), "hi")
+        self.assertEqual(_strip("[Tg] hi"), "hi")
 
     def test_no_marker_unchanged(self):
         self.assertEqual(_strip("just text"), "just text")

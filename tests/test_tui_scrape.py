@@ -9,7 +9,7 @@ captured from the real Codex TUI. Both bugs found on 2026-06-20 are covered:
   * a stale line still visible in the pane from a previous turn must NOT be re-emitted — the
     per-turn dedup is seeded with what's already on screen.
 
-Pure function, milliseconds in CI, so the behavior Petr used to verify by hand is now automatic.
+Pure function, milliseconds in CI, so behaviour that used to be checked by hand is now automatic.
 """
 import unittest
 
@@ -18,22 +18,22 @@ from agent2telegram.attach import _extract_tui_tools
 # A real Codex TUI capture: agent text on bullet lines, a command on a bullet line with its
 # output nested under "└", a file read, and trailing UI chrome.
 PANE_DISK = """\
-  [TG] Kolik máme místa na disku?
-● Ověřím aktuální volné místo na hlavním oddílu.
+  [TG] How much disk space is left?
+● Let me check the free space on the main partition.
 ● Ran df -h /
   └ Filesystem      Size  Used Avail Use% Mounted on
     /dev/sda1        48G  2.3G   46G   5% /
 ● Read /etc/hosts
-● Na hlavním disku / je volno 46 GB z celkových 48 GB.
+● The main disk / has 46 GB free out of 48 GB.
 > 0;10;1c
   gpt-5.5 default · ~
 """
 
 PANE_WEB = """\
-● Ověřím to z webu, protože výška veřejné osoby bývá často špatně opsaná.
+● Let me check the web, because figures like this are often miscopied.
 ● Searching the web
-● Searched the web for Warhorse Studios Daniel Vávra bio official
-● Nenašel jsem spolehlivě doložený údaj o výšce.
+● Searched the web for example corporation founding year official
+● I could not find a reliably sourced figure.
 """
 
 
@@ -52,14 +52,14 @@ class TuiScrapeTests(unittest.TestCase):
         self.assertFalse(any("/dev/sda1" in s for s in out))
 
     def test_agent_text_is_not_a_bubble(self):
-        """Plain agent prose on a bullet line (Czech, not a known verb) must be ignored."""
+        """Plain agent prose on a bullet line (not a known verb) must be ignored."""
         out = _extract_tui_tools(PANE_DISK)
-        self.assertFalse(any("Ověřím" in s for s in out))
-        self.assertFalse(any("volno" in s for s in out))
+        self.assertFalse(any("Let me check" in s for s in out))
+        self.assertFalse(any("free out of" in s for s in out))
 
     def test_web_search_query_extracted(self):
         out = _extract_tui_tools(PANE_WEB)
-        self.assertTrue(any(s.startswith("🔎 Web search:") and "Warhorse" in s for s in out))
+        self.assertTrue(any(s.startswith("🔎 Web search:") and "example corporation" in s for s in out))
 
     def test_web_search_in_progress(self):
         self.assertEqual(_extract_tui_tools("● Searching the web"), ["🔎 Searching the web"])

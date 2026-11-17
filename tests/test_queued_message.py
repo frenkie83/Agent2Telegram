@@ -189,7 +189,7 @@ def _make_bridge(tmpdir: Path) -> AttachBridge:
     same style as test_marker.py's ``_strip`` helper (no tmux, no transcript, no network)."""
     b = object.__new__(AttachBridge)
     b.tg = _FakeTelegram()
-    b.cfg = types.SimpleNamespace(agent="claude-code")
+    b.cfg = types.SimpleNamespace(agent="claude-code", file_marker="")
     b._origins = ("[TG]", "Telegram:")
     b._turn_from_tg = False
     b._owner_chat = 555
@@ -201,6 +201,7 @@ def _make_bridge(tmpdir: Path) -> AttachBridge:
     b._seen_tools = set()
     b._pending_send = []
     b._turn_text_sent = False
+    b._turn_active = threading.Event()
     return b
 
 
