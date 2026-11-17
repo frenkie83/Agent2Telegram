@@ -164,11 +164,7 @@ class MalformedRecordInDrainChunkTests(unittest.TestCase):
                 _assistant_record("odpoved"),
             ])
 
-            try:
-                b._drain_transcript()
-            except Exception:
-                pass                                # the outbound loop logs and carries on
-            b._drain_transcript()                   # the next tick
+            b._drain_transcript()                   # ONE pass, no `except`: it must not raise
 
             self.assertEqual(b.tg.sent, ["odpoved"])
 

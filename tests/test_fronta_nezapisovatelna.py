@@ -385,6 +385,23 @@ class GiveUpAfterUnrecordedChunksTests(unittest.TestCase):
             self.assertEqual(b._pending_send, [])
             self.assertEqual(b.tg.sent, [])
 
+    def test_a_reply_with_the_same_attachment_twice_does_not_wedge_the_outbound_path(self):
+        """Review (PR #9): `enqueue` also raises `ValueError` for a duplicate file path; that must
+        take the in-memory fallback like before T-1060, not escape with `_pending_files` unchanged
+        (every later reply would then fail the same way)."""
+        with tempfile.TemporaryDirectory() as td:
+            b = _loop_bridge(td)
+            b._ensure_outbox()
+            events = []
+            b.tg.send_message = lambda chat, text, parse_mode=None: events.append(text)
+            b._send_one_file = lambda p: events.append(("file", p))
+            b._pending_files = ["/outbox/x.png", "/outbox/x.png"]
+            b._send_final("done", "k1")
+            b._send_final("next", "k2")           # enqueues durably — must not raise
+            b._flush_pending()
+            self.assertEqual(events[:2], ["done", ("file", "/outbox/x.png")])
+            self.assertIn("next", events)
+
 
 if __name__ == "__main__":
     unittest.main()

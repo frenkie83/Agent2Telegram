@@ -1240,7 +1240,7 @@ class AttachBridge:
                 # the in-memory path would hide that (and could send a second, different reply
                 # under the id) — it surfaces exactly as it did before T-1060.
                 raise
-            except (OSError, DurableError) as e:      # only what a refusing disk raises
+            except Exception as e:      # as before T-1060 (e.g. `ValueError` for a duplicate file path)
                 # Throttled: a reply per tick while the disk is bad would flood that disk's log.
                 self._ledger_warn("queue-enqueue", "could not persist the outgoing reply, falling "
                                   "back to the old path (in memory, retried every tick): %s", e)
