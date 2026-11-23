@@ -409,14 +409,34 @@ class AttachBridge:
 
     def _session_cwd(self) -> str | None:
         """Working directory of the driven tmux session — used to pick the matching Codex
-        rollout even when other `codex` processes (e.g. cron jobs) write newer rollouts."""
-        try:
-            out = subprocess.run(
-                ["tmux", "display-message", "-p", "-t", self.cfg.tmux_session, "#{pane_current_path}"],
-                capture_output=True, text=True, timeout=5)
-            return out.stdout.strip() or None
-        except (subprocess.SubprocessError, OSError):
-            return None
+        rollout even when other `codex` processes (e.g. cron jobs) write newer rollouts.
+
+        A failed `tmux display-message` (timeout, rc != 0, empty output) is retried once and then
+        logged as a WARNING with rc/stderr (rate-limited), because ``None`` makes the callers guess
+        across projects — a silent failure here is how a bridge ended up on a foreign transcript."""
+        reason = ""
+        for attempt in range(2):
+            try:
+                out = subprocess.run(
+                    ["tmux", "display-message", "-p", "-t", self.cfg.tmux_session, "#{pane_current_path}"],
+                    capture_output=True, text=True, timeout=5)
+            except subprocess.TimeoutExpired:
+                reason = "timeout after 5s"
+            except (subprocess.SubprocessError, OSError) as e:
+                reason = f"{type(e).__name__}: {e}"
+            else:
+                cwd = (out.stdout or "").strip()
+                if out.returncode == 0 and cwd:
+                    return cwd
+                reason = f"rc={out.returncode} stderr={(out.stderr or '').strip()[:200]!r} stdout={cwd!r}"
+            if attempt == 0:
+                time.sleep(0.2)
+        now = time.monotonic()
+        if now - getattr(self, "_cwd_warned_at", -1e9) >= 60.0:
+            self._cwd_warned_at = now
+            log.warning("tmux display-message for session %r failed twice (%s) — cwd unknown",
+                        self.cfg.tmux_session, reason)
+        return None
 
     @staticmethod
     def _rollout_cwd(path: Path) -> str | None:
@@ -457,6 +477,7 @@ class AttachBridge:
                 if self._norm(self._rollout_cwd(Path(f))) == cwd:
                     return Path(f)
             return None                           # cwd known but no rollout yet → wait, don't grab
+        self._resolved_without_cwd = True
         return Path(files[0])                     # cwd unknown → best-effort newest overall
 
     def _resolve_transcript(self) -> Path | None:
@@ -466,6 +487,9 @@ class AttachBridge:
         # newest transcript across ALL projects (see _newest_claude). Such a guess must not be
         # published to the Stop hook — it may well be another session's file.
         self._transcript_best_effort = False
+        # Raised by the auto-detection when the tmux cwd was unknown and it had to guess across
+        # projects. _maybe_reresolve never lets such a guess replace a transcript already tailed.
+        self._resolved_without_cwd = False
         tp = (self.cfg.transcript_path or "").strip()
         if tp and tp.lower() != "auto":
             p = Path(tp).expanduser()
@@ -495,6 +519,7 @@ class AttachBridge:
             # that is not ours. Usable for tailing (best effort), but flagged so it is never
             # published to the Stop hook as "this is my transcript".
             self._transcript_best_effort = True
+            self._resolved_without_cwd = True
             return self._newest_under(base)
         best, best_m = None, -1.0
         for d in dirs:
@@ -520,6 +545,10 @@ class AttachBridge:
             return
         self._last_resolve = now
         newest = self._resolve_transcript()
+        if getattr(self, "_resolved_without_cwd", False) and self._transcript is not None:
+            # A cwd-less guess never moves us (T-1139) and is no evidence either: do not even
+            # re-publish, or the recomputed best-effort flag would blank the Stop hook's path.
+            return
         if not newest or newest == self._transcript:
             # Same file as before — but what we may PUBLISH about it can have changed: a bridge
             # that started before its tmux cwd was readable published an empty file (a
@@ -532,10 +561,8 @@ class AttachBridge:
         # cwd-scoped resolution returns OUR session's own log, so follow it even mid-turn: a new
         # rollout for the same session means the current turn is being written THERE. Blocking the
         # switch while a turn was active caused a ~90s lag (it only switched after the idle timeout)
-        # — the first message looked like it took ~2 minutes. Only the cwd-unknown best-effort
-        # fallback still avoids jumping away during a live turn.
-        if self._session_cwd() is None and self._transcript is not None and self._turn_active.is_set():
-            return
+        # — the first message looked like it took ~2 minutes.
+        # (A cwd-less guess never gets here — it returns right after the resolve above.)
         log.info("transcript → %s", newest.name)
         self._transcript = newest
         self._publish_transcript()     # the global Stop hook must follow us to the new file
