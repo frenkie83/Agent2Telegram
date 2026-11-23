@@ -51,6 +51,28 @@ class ClaudeUnknownCwdTests(unittest.TestCase):
                 self.assertTrue(b._transcript_best_effort)
 
 
+class PublishedPathSurvivesCwdOutageTests(unittest.TestCase):
+    def test_same_file_guess_does_not_blank_published_transcript(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as td:
+            base = Path(home) / ".claude" / "projects"
+            cwd = "/work/a"
+            a = _touch(base / cwd.replace("/", "-") / "a.jsonl", 9000.0)  # A je zaroven nejnovejsi
+            with mock.patch.object(Path, "home", return_value=Path(home)):
+                b = _regrese_bridge(td)
+                b.cfg.transcript_path = ""
+                cur = {"v": cwd}
+                b._session_cwd = lambda: cur["v"]
+                b._transcript = b._resolve_transcript()
+                b._last_resolve = 0.0
+                b._maybe_reresolve()
+                published = b._signal.parent / "transcript"
+                self.assertEqual(published.read_text(), os.path.realpath(a))
+                cur["v"] = None
+                b._last_resolve = 0.0
+                b._maybe_reresolve()
+                self.assertEqual(published.read_text(), os.path.realpath(a))
+
+
 class CodexUnknownCwdTests(unittest.TestCase):
     def test_known_then_unknown_cwd_stays_on_own_rollout(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as td:

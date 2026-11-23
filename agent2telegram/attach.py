@@ -545,6 +545,10 @@ class AttachBridge:
             return
         self._last_resolve = now
         newest = self._resolve_transcript()
+        if getattr(self, "_resolved_without_cwd", False) and self._transcript is not None:
+            # A cwd-less guess never moves us (T-1139) and is no evidence either: do not even
+            # re-publish, or the recomputed best-effort flag would blank the Stop hook's path.
+            return
         if not newest or newest == self._transcript:
             # Same file as before — but what we may PUBLISH about it can have changed: a bridge
             # that started before its tmux cwd was readable published an empty file (a
@@ -558,11 +562,7 @@ class AttachBridge:
         # rollout for the same session means the current turn is being written THERE. Blocking the
         # switch while a turn was active caused a ~90s lag (it only switched after the idle timeout)
         # — the first message looked like it took ~2 minutes.
-        # A resolve that had to guess (tmux cwd unknown) is never a reason to leave the transcript
-        # we already tail, turn or no turn (T-1139: 23. 11. a bridge jumped to another project's
-        # newest file and forwarded its text). Guessing is allowed only at startup, with no file yet.
-        if getattr(self, "_resolved_without_cwd", False) and self._transcript is not None:
-            return
+        # (A cwd-less guess never gets here — it returns right after the resolve above.)
         log.info("transcript → %s", newest.name)
         self._transcript = newest
         self._publish_transcript()     # the global Stop hook must follow us to the new file
